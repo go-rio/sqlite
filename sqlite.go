@@ -9,8 +9,10 @@
 //   - Precise error translation: SQLite constraint failures become
 //     rio.ErrDuplicateKey and rio.ErrForeignKeyViolated, with the driver
 //     error kept in the chain for errors.As.
-//   - DSN hygiene: Open enables foreign key enforcement and a busy timeout
-//     unless the DSN sets those pragmas itself.
+//   - DSN hygiene: Open enables foreign key enforcement, a busy timeout,
+//     and the driver's SQLite-text time format (_time_format=sqlite, for
+//     non-rio writers sharing the handle) unless the DSN sets those keys
+//     itself.
 //
 // All SQL grammar lives in github.com/go-rio/rio; this package never
 // implements a dialect.
@@ -36,11 +38,21 @@ const driverName = "sqlite"
 //
 // Before handing the DSN to modernc.org/sqlite, Open appends the default
 // pragmas described on defaultPragmas — foreign_keys(1) and
-// busy_timeout(5000). A _pragma the DSN already sets is respected, never
-// overridden.
+// busy_timeout(5000) — plus the _time_format=sqlite driver parameter (see
+// defaultParams). A key the DSN already sets is respected, never overridden.
 //
 // Like database/sql itself, Open validates nothing eagerly: a bad path or
 // DSN surfaces on first use (or on an explicit Ping).
+//
+// In-memory databases: a plain ":memory:" (or "file::memory:" without a
+// shared cache) gives every pooled connection its own private, empty
+// database, so a table created on one connection is invisible to the next —
+// the default database/sql pool opens several. For an in-memory database that
+// behaves like one shared store, use a shared-cache DSN and pin the pool to a
+// single connection:
+//
+//	db, _ := sqlite.Open("file:app?mode=memory&cache=shared")
+//	db.Unwrap().SetMaxOpenConns(1) // rio never tunes the pool for you
 func Open(dsn string, opts ...rio.Option) (*rio.DB, error) {
 	db, err := sql.Open(driverName, withDefaultPragmas(dsn))
 	if err != nil {
