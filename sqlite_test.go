@@ -81,7 +81,6 @@ func TestOpenEndToEnd(t *testing.T) {
 		t.Fatal("Insert did not backfill the primary key")
 	}
 
-	// Find round-trips the row by primary key.
 	got, err := rio.Find[user](ctx, db, alice.ID)
 	if err != nil {
 		t.Fatalf("Find: %v", err)
@@ -161,15 +160,10 @@ func TestForeignKeysEnforced(t *testing.T) {
 func TestConcurrentWrites(t *testing.T) {
 	ctx := context.Background()
 
-	// A file-backed database gives the pool's connections a real shared file
-	// to contend over, configured the way a concurrent-write deployment
-	// should be (the README's production settings): WAL so readers never
-	// block the writer, synchronous=NORMAL (WAL's recommended durability
-	// point), _txlock=immediate so write transactions take the lock up
-	// front instead of hitting SQLite's non-retryable upgrade deadlock, and
-	// a busy_timeout wide enough for a slow CI runner. Open's defaults
-	// respect every explicit parameter and only add what is missing
-	// (foreign_keys here).
+	// File-backed so the pool's connections contend over a real shared file,
+	// with the README's production concurrency settings (WAL,
+	// synchronous=NORMAL, _txlock=immediate, wide busy_timeout). Open's
+	// defaults add only what's missing here: foreign_keys.
 	db, err := Open(filepath.Join(t.TempDir(), "concurrent.db") +
 		"?_txlock=immediate&_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)")
 	if err != nil {
@@ -215,10 +209,9 @@ func TestConcurrentWrites(t *testing.T) {
 
 func TestOpenEmptyDSN(t *testing.T) {
 	// An empty DSN is SQLite's private, per-connection temporary database.
-	// Open used to append "?_pragma=..." to it, and the driver read that
-	// whole string as a literal file name: the pragmas silently never
-	// applied and a garbage file appeared in the working directory. Run
-	// from a fresh directory so any such file is caught.
+	// Appending "?_pragma=..." to it would make the driver read the whole
+	// string as a literal file name — pragmas silently skipped, a garbage
+	// file in the cwd. Run from a fresh directory so any such file is caught.
 	t.Chdir(t.TempDir())
 	ctx := context.Background()
 
