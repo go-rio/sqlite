@@ -1,8 +1,9 @@
 # sqlite
 
-[![Doc](https://pkg.go.dev/badge/github.com/go-rio/sqlite)](https://pkg.go.dev/github.com/go-rio/sqlite)
+[![Doc](https://pkg.go.dev/badge/github.com/go-rio/sqlite.svg)](https://pkg.go.dev/github.com/go-rio/sqlite)
 [![Go](https://img.shields.io/github/go-mod/go-version/go-rio/sqlite)](https://go.dev/)
-[![Test](https://github.com/go-rio/sqlite/actions/workflows/test.yml/badge.svg)](https://github.com/go-rio/sqlite/actions)
+[![Release](https://img.shields.io/github/release/go-rio/sqlite.svg)](https://github.com/go-rio/sqlite/releases)
+[![Test](https://github.com/go-rio/sqlite/actions/workflows/test.yml/badge.svg)](https://github.com/go-rio/sqlite/actions/workflows/test.yml)
 [![License](https://img.shields.io/github/license/go-rio/sqlite)](https://opensource.org/license/MIT)
 
 SQLite driver module for [rio](https://github.com/go-rio/rio), built on the
