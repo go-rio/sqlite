@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -205,6 +206,58 @@ func TestConcurrentWrites(t *testing.T) {
 	}
 }
 
+func TestOpenEmptyDSN(t *testing.T) {
+	// An empty DSN is SQLite's private, per-connection temporary database.
+	// Open used to append "?_pragma=..." to it, and the driver read that
+	// whole string as a literal file name: the pragmas silently never
+	// applied and a garbage file appeared in the working directory. Run
+	// from a fresh directory so any such file is caught.
+	t.Chdir(t.TempDir())
+	ctx := context.Background()
+
+	db, err := Open("")
+	if err != nil {
+		t.Fatalf(`Open(""): %v`, err)
+	}
+	db.Unwrap().SetMaxOpenConns(1)
+	mustExec(t, db, testSchema)
+
+	// The default pragmas apply.
+	for pragma, want := range map[string]int64{"foreign_keys": 1, "busy_timeout": 5000} {
+		var got int64
+		if err := db.Unwrap().QueryRow("PRAGMA " + pragma).Scan(&got); err != nil {
+			t.Fatalf("PRAGMA %s: %v", pragma, err)
+		}
+		if got != want {
+			t.Errorf("PRAGMA %s = %d, want %d", pragma, got, want)
+		}
+	}
+
+	// Foreign key enforcement is really live, and the temporary database
+	// is writable like any other.
+	orphan := post{UserID: 9001, Title: "orphan"}
+	if err := rio.Insert(ctx, db, &orphan); !errors.Is(err, rio.ErrForeignKeyViolated) {
+		t.Fatalf("orphan insert: got %v, want rio.ErrForeignKeyViolated", err)
+	}
+	owner := user{Email: "owner@example.com", Name: "Owner"}
+	if err := rio.Insert(ctx, db, &owner); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+
+	// Nothing is left behind in the working directory, before or after
+	// Close — the temporary database lives (and dies) elsewhere.
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	for _, e := range entries {
+		t.Errorf(`Open("") left %q in the working directory`, e.Name())
+	}
+}
+
 func TestNewInstallsTranslator(t *testing.T) {
 	ctx := context.Background()
 
@@ -272,6 +325,10 @@ func TestWithDefaultPragmas(t *testing.T) {
 		dsn  string
 		want string
 	}{
+		// The empty DSN (private temporary database) is respelled as a
+		// "file:" URI: appending "?..." directly would make the '?' the
+		// first byte, which the driver reads as a literal file name.
+		{"", "file:?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)" + times},
 		{":memory:", ":memory:?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)" + times},
 		{"app.db", "app.db?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)" + times},
 		{"file:app.db?mode=ro", "file:app.db?mode=ro&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)" + times},

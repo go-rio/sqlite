@@ -40,6 +40,9 @@ const driverName = "sqlite"
 // pragmas described on defaultPragmas — foreign_keys(1) and
 // busy_timeout(5000) — plus the _time_format=sqlite driver parameter (see
 // defaultParams). A key the DSN already sets is respected, never overridden.
+// An empty DSN — SQLite's private, per-connection temporary on-disk
+// database — is respelled as the equivalent "file:" URI first, so the
+// defaults apply to it too.
 //
 // Like database/sql itself, Open validates nothing eagerly: a bad path or
 // DSN surfaces on first use (or on an explicit Ping).
@@ -130,8 +133,17 @@ var defaultParams = [...][2]string{
 // withDefaultPragmas appends the missing defaultPragmas to dsn. A pragma the
 // user set explicitly — with any value — is respected and never duplicated.
 // The user's DSN text is preserved byte for byte; defaults are only ever
-// appended.
+// appended — with one exception: the empty DSN (SQLite's private,
+// per-connection temporary database) is respelled as the equivalent "file:"
+// URI first, because appending "?..." to an empty string would produce a DSN
+// whose first byte is '?', which the driver reads as a literal file name.
 func withDefaultPragmas(dsn string) string {
+	if dsn == "" {
+		// "file:" with an empty name opens the same private temporary
+		// database as "", and its query part is parsed, so the defaults
+		// below apply.
+		dsn = "file:"
+	}
 	var rawQuery string
 	pos := strings.IndexByte(dsn, '?')
 	switch {
