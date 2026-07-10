@@ -77,6 +77,41 @@ db.Unwrap().SetMaxOpenConns(1) // rio never tunes the pool for you
 
 A file-backed DSN has no such caveat.
 
+## Concurrent writes
+
+SQLite allows one writer at a time — under a concurrent pool, writers
+serialize on the database lock, and the default five-second `busy_timeout` is
+the only thing standing between a slow moment and `SQLITE_BUSY`. Two
+deployment shapes handle write concurrency well:
+
+**Configure the file for concurrency** (recommended for mixed read/write
+load):
+
+```go
+db, err := sqlite.Open("app.db" +
+	"?_txlock=immediate" +            // write txs take the lock up front: no
+	                                  // non-retryable upgrade deadlocks
+	"&_pragma=journal_mode(WAL)" +    // readers never block the writer
+	"&_pragma=synchronous(NORMAL)" +  // WAL's recommended durability point
+	"&_pragma=busy_timeout(10000)")
+```
+
+`journal_mode(WAL)` is persistent (it sticks to the database file) and
+creates `-wal`/`-shm` sidecar files; it does not work on read-only media or
+most network filesystems, which is why `Open` recommends rather than defaults
+it.
+
+**Or serialize everything yourself** — one connection, no contention, no
+busy handling at all:
+
+```go
+db.Unwrap().SetMaxOpenConns(1)
+db.Unwrap().SetMaxIdleConns(1)
+```
+
+rio never tunes the pool for you; both shapes are one line on the handle you
+already own.
+
 ## Error translation
 
 Unique and primary key violations come back as `rio.ErrDuplicateKey`, foreign

@@ -162,9 +162,16 @@ func TestConcurrentWrites(t *testing.T) {
 	ctx := context.Background()
 
 	// A file-backed database gives the pool's connections a real shared file
-	// to contend over. Without busy_timeout a writer that finds the file
-	// locked would fail immediately with SQLITE_BUSY instead of waiting.
-	db, err := Open(filepath.Join(t.TempDir(), "concurrent.db"))
+	// to contend over, configured the way a concurrent-write deployment
+	// should be (the README's production settings): WAL so readers never
+	// block the writer, synchronous=NORMAL (WAL's recommended durability
+	// point), _txlock=immediate so write transactions take the lock up
+	// front instead of hitting SQLite's non-retryable upgrade deadlock, and
+	// a busy_timeout wide enough for a slow CI runner. Open's defaults
+	// respect every explicit parameter and only add what is missing
+	// (foreign_keys here).
+	db, err := Open(filepath.Join(t.TempDir(), "concurrent.db") +
+		"?_txlock=immediate&_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)")
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
