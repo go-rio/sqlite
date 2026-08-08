@@ -1,21 +1,6 @@
-// Package sqlite connects rio, the zero-surprise Go ORM, to SQLite through
-// the pure-Go modernc.org/sqlite driver — no cgo required.
-//
-// Driver modules are deliberately thin. This package contains exactly three
-// things, and nothing else:
-//
-//   - Constructors: Open (from a DSN) and New (bring your own *sql.DB), both
-//     returning a *rio.DB speaking the built-in rio.SQLite dialect.
-//   - Precise error translation: SQLite constraint failures become
-//     rio.ErrDuplicateKey and rio.ErrForeignKeyViolated, with the driver
-//     error kept in the chain for errors.As.
-//   - DSN hygiene: Open enables foreign key enforcement, a busy timeout,
-//     and the driver's SQLite-text time format (_time_format=sqlite, for
-//     non-rio writers sharing the handle) unless the DSN sets those keys
-//     itself.
-//
-// All SQL grammar lives in github.com/go-rio/rio; this package never
-// implements a dialect.
+// Package sqlite connects rio to SQLite through the pure-Go modernc.org/sqlite
+// driver. It adds DSN defaults and translates SQLite constraint errors to rio
+// sentinel errors while retaining the driver error in the chain.
 package sqlite
 
 import (
@@ -30,32 +15,18 @@ import (
 	sqlite3 "modernc.org/sqlite/lib"
 )
 
-// driverName is the name modernc.org/sqlite registers with database/sql.
 const driverName = "sqlite"
 
-// Open opens a SQLite database and returns a *rio.DB speaking the rio.SQLite
-// dialect with this package's error translator installed.
+// Open opens a SQLite database with the rio.SQLite dialect and SQLite error
+// translation. It adds foreign_keys(1), busy_timeout(5000), and
+// _time_format=sqlite unless the DSN already specifies them. Invalid paths and
+// DSNs surface on first use or Ping.
 //
-// Before handing the DSN to modernc.org/sqlite, Open appends the default
-// pragmas described on defaultPragmas — foreign_keys(1) and
-// busy_timeout(5000) — plus the _time_format=sqlite driver parameter (see
-// defaultParams). A key the DSN already sets is respected, never overridden.
-// An empty DSN — SQLite's private, per-connection temporary on-disk
-// database — is respelled as the equivalent "file:" URI first, so the
-// defaults apply to it too.
-//
-// Like database/sql itself, Open validates nothing eagerly: a bad path or
-// DSN surfaces on first use (or on an explicit Ping).
-//
-// In-memory databases: a plain ":memory:" (or "file::memory:" without a
-// shared cache) gives every pooled connection its own private, empty
-// database, so a table created on one connection is invisible to the next —
-// the default database/sql pool opens several. For an in-memory database that
-// behaves like one shared store, use a shared-cache DSN and pin the pool to a
-// single connection:
+// Each connection to a plain ":memory:" database is isolated. To share an
+// in-memory database, use a shared-cache DSN and one open connection:
 //
 //	db, _ := sqlite.Open("file:app?mode=memory&cache=shared")
-//	db.Unwrap().SetMaxOpenConns(1) // rio never tunes the pool for you
+//	db.Unwrap().SetMaxOpenConns(1)
 func Open(dsn string, opts ...rio.Option) (*rio.DB, error) {
 	db, err := sql.Open(driverName, withDefaultPragmas(dsn))
 	if err != nil {
@@ -64,24 +35,16 @@ func Open(dsn string, opts ...rio.Option) (*rio.DB, error) {
 	return New(db, opts...), nil
 }
 
-// New wraps an existing *sql.DB — bring your own connection pool — in a
-// *rio.DB speaking the rio.SQLite dialect with this package's error
-// translator installed. A rio.WithErrorTranslator among opts wins over the
-// built-in translator.
-//
-// New performs no DSN hygiene, because the pool already exists. In
-// particular, foreign key enforcement is whatever the caller's DSN says —
-// and SQLite's historical default is off, in which case
-// rio.ErrForeignKeyViolated can never happen (see Open).
+// New wraps db with the rio.SQLite dialect and SQLite error translation. It
+// does not configure the existing pool or enable foreign key enforcement. A
+// rio.WithErrorTranslator option overrides the built-in translator.
 func New(db *sql.DB, opts ...rio.Option) *rio.DB {
 	return rio.New(db, rio.SQLite,
 		append([]rio.Option{rio.WithErrorTranslator(translate)}, opts...)...)
 }
 
-// translate maps modernc.org/sqlite errors to rio's sentinel errors. It
-// returns nil for errors it does not recognize, per the
-// rio.WithErrorTranslator contract. rio keeps the driver error in the chain,
-// so errors.As still reaches the *sqlite.Error after translation.
+// translate returns nil for unrecognized errors, as required by rio's error
+// translator contract.
 func translate(err error) error {
 	var se *driver.Error
 	if !errors.As(err, &se) {
@@ -97,51 +60,21 @@ func translate(err error) error {
 	return nil
 }
 
-// defaultPragmas are the connection pragmas Open appends when the DSN does
-// not set the same pragma itself. modernc.org/sqlite executes each
-// _pragma=name(value) query parameter as PRAGMA name(value) on every new
-// connection, so the defaults hold across the entire connection pool.
-//
-//   - foreign_keys(1): SQLite keeps foreign key enforcement OFF by default
-//     for historical compatibility — FOREIGN KEY constraints parse but never
-//     fire. Without this pragma, rio's promised rio.ErrForeignKeyViolated
-//     would never happen on SQLite; turning it on is one of the core reasons
-//     this package exists.
-//   - busy_timeout(5000): without a busy timeout, a writer that finds the
-//     database file locked by another connection fails immediately with
-//     SQLITE_BUSY; with it, SQLite retries for up to five seconds first.
+// defaultPragmas enable foreign keys and allow five seconds for a locked
+// database to become writable. The driver applies them to every connection.
 var defaultPragmas = [...]string{"busy_timeout(5000)", "foreign_keys(1)"}
 
-// defaultParams are non-pragma driver parameters Open appends when the DSN
-// does not set the same key itself.
-//
-//   - _time_format=sqlite: time.Time values bound directly (not through
-//     rio, which binds canonical text itself) are stored in SQLite's own
-//     datetime format instead of Go's time.Time.String() form, which
-//     SQLite's date functions cannot parse. Pure write-side, no downside.
-//
-// The driver's read-side conversions (_texttotime=1, _inttotime=1) are NOT
-// defaulted: they rewrite scanned values by declared column type, so an
-// INTEGER unix-timestamp column mapped to an int64 field — a completely
-// ordinary SQLite pattern — would arrive as time.Time and fail to scan.
-// Add them to your DSN explicitly if code reading through Unwrap() wants
-// time.Time out of DATETIME columns.
+// defaultParams make directly bound time.Time values readable by SQLite date
+// functions. Read-side time conversion stays opt-in because it can change
+// INTEGER scan values into time.Time.
 var defaultParams = [...][2]string{
 	{"_time_format", "sqlite"},
 }
 
-// withDefaultPragmas appends the missing defaultPragmas to dsn. A pragma the
-// user set explicitly — with any value — is respected and never duplicated.
-// The user's DSN text is preserved byte for byte; defaults are only ever
-// appended — with one exception: the empty DSN (SQLite's private,
-// per-connection temporary database) is respelled as the equivalent "file:"
-// URI first, because appending "?..." to an empty string would produce a DSN
-// whose first byte is '?', which the driver reads as a literal file name.
+// withDefaultPragmas appends missing defaults without overriding explicit
+// values. It rewrites an empty DSN as "file:" so the driver parses the query.
 func withDefaultPragmas(dsn string) string {
 	if dsn == "" {
-		// "file:" with an empty name opens the same private temporary
-		// database as "", and its query part is parsed, so the defaults
-		// below apply.
 		dsn = "file:"
 	}
 	var rawQuery string
@@ -150,27 +83,24 @@ func withDefaultPragmas(dsn string) string {
 	case pos > 0:
 		rawQuery = dsn[pos+1:]
 	case pos == 0:
-		// The driver reads a query part only after the first byte, so a DSN
-		// that starts with '?' is a plain file name; appending anything would
-		// rename the file. Leave it alone.
+		// A leading '?' is part of the file name, not a query delimiter.
 		return dsn
 	}
 	q, err := url.ParseQuery(rawQuery)
 	if err != nil {
-		// A malformed query cannot be amended safely. Pass it through
-		// untouched; the driver reports the parse error on first use.
+		// Preserve malformed DSNs for the driver to reject.
 		return dsn
 	}
 	var add []string
 	for _, def := range defaultPragmas {
-		set := false
+		isSet := false
 		for _, v := range q["_pragma"] {
 			if pragmaName(v) == pragmaName(def) {
-				set = true
+				isSet = true
 				break
 			}
 		}
-		if !set {
+		if !isSet {
 			add = append(add, "_pragma="+def)
 		}
 	}
@@ -184,22 +114,21 @@ func withDefaultPragmas(dsn string) string {
 	}
 	sep := "?"
 	if pos > 0 {
+		sep = "&"
 		if rawQuery == "" {
 			sep = "" // the DSN already ends in "?"
-		} else {
-			sep = "&"
 		}
 	}
 	return dsn + sep + strings.Join(add, "&")
 }
 
-// pragmaName extracts the lower-cased pragma name from a _pragma value such
-// as "busy_timeout(5000)", "foreign_keys(1)" or "journal_mode = WAL".
 func pragmaName(v string) string {
 	v = strings.TrimSpace(v)
 	for i := 0; i < len(v); i++ {
 		c := v[i]
-		if c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' {
+		isLetter := c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
+		isDigit := c >= '0' && c <= '9'
+		if c == '_' || isLetter || isDigit {
 			continue
 		}
 		v = v[:i]
