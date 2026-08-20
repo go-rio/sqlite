@@ -163,9 +163,7 @@ func TestConcurrentWrites(t *testing.T) {
 	errs := make(chan error, writers)
 	var wg sync.WaitGroup
 	for w := range writers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for i := range rows {
 				u := user{Email: fmt.Sprintf("w%d-%d@example.com", w, i), Name: "writer"}
 				if err := rio.Insert(ctx, db, &u); err != nil {
@@ -173,7 +171,7 @@ func TestConcurrentWrites(t *testing.T) {
 					return
 				}
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	close(errs)

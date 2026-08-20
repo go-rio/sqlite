@@ -8,7 +8,7 @@ jobs:
   test:
     strategy:
       matrix:
-        go: [ "oldstable", "stable" ]
+        go: ["stable"]
         platform: [ ubuntu-latest, macos-latest, windows-latest ]
     runs-on: ${{ matrix.platform }}
     steps:
