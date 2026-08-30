@@ -19,14 +19,11 @@ const driverName = "sqlite"
 
 // Open opens a SQLite database with the rio.SQLite dialect and SQLite error
 // translation. It adds foreign_keys(1), busy_timeout(5000), and
-// _time_format=sqlite unless the DSN already specifies them. Invalid paths and
-// DSNs surface on first use or Ping.
+// _time_format=sqlite unless the DSN already specifies them. Invalid paths
+// and DSNs surface on first use or Ping.
 //
-// Each connection to a plain ":memory:" database is isolated. To share an
-// in-memory database, use a shared-cache DSN and one open connection:
-//
-//	db, _ := sqlite.Open("file:app?mode=memory&cache=shared")
-//	db.Unwrap().SetMaxOpenConns(1)
+// Each connection to a plain ":memory:" database is isolated; to share one,
+// use "file:app?mode=memory&cache=shared" and SetMaxOpenConns(1).
 func Open(dsn string, opts ...rio.Option) (*rio.DB, error) {
 	db, err := sql.Open(driverName, withDefaultPragmas(dsn))
 	if err != nil {
@@ -36,37 +33,34 @@ func Open(dsn string, opts ...rio.Option) (*rio.DB, error) {
 }
 
 // New wraps db with the rio.SQLite dialect and SQLite error translation. It
-// does not configure the existing pool or enable foreign key enforcement. A
+// does not configure the pool or enable foreign key enforcement. A
 // rio.WithErrorTranslator option overrides the built-in translator.
 func New(db *sql.DB, opts ...rio.Option) *rio.DB {
 	return rio.New(db, rio.SQLite,
 		append([]rio.Option{rio.WithErrorTranslator(translate)}, opts...)...)
 }
 
-// translate returns nil for unrecognized errors, as required by rio's error
-// translator contract.
+// translate maps constraint errors to rio sentinels, nil otherwise.
 func translate(err error) error {
 	var se *driver.Error
 	if !errors.As(err, &se) {
 		return nil
 	}
 	switch se.Code() {
-	case sqlite3.SQLITE_CONSTRAINT_UNIQUE, // 2067
-		sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY: // 1555
+	case sqlite3.SQLITE_CONSTRAINT_UNIQUE,
+		sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY:
 		return rio.ErrDuplicateKey
-	case sqlite3.SQLITE_CONSTRAINT_FOREIGNKEY: // 787
+	case sqlite3.SQLITE_CONSTRAINT_FOREIGNKEY:
 		return rio.ErrForeignKeyViolated
 	}
 	return nil
 }
 
-// defaultPragmas enable foreign keys and allow five seconds for a locked
-// database to become writable. The driver applies them to every connection.
+// The driver applies these to every connection.
 var defaultPragmas = [...]string{"busy_timeout(5000)", "foreign_keys(1)"}
 
-// defaultParams make directly bound time.Time values readable by SQLite date
-// functions. Read-side time conversion stays opt-in because it can change
-// INTEGER scan values into time.Time.
+// _time_format=sqlite makes bound time.Time readable by SQLite date functions;
+// read-side conversion stays opt-in (it can turn INTEGER scans into time.Time).
 var defaultParams = [...][2]string{
 	{"_time_format", "sqlite"},
 }

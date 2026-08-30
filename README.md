@@ -7,8 +7,8 @@
 [![License](https://img.shields.io/github/license/go-rio/sqlite)](https://opensource.org/license/MIT)
 
 SQLite driver module for [rio](https://github.com/go-rio/rio), backed by the
-pure-Go [modernc.org/sqlite](https://pkg.go.dev/modernc.org/sqlite) driver. It
-adds SQLite connection defaults and error translation; rio owns SQL rendering.
+pure-Go [modernc.org/sqlite](https://pkg.go.dev/modernc.org/sqlite) driver:
+connection defaults plus error translation; rio owns SQL rendering.
 
 ## Getting started
 
@@ -17,11 +17,6 @@ go get github.com/go-rio/sqlite
 ```
 
 ```go
-import (
-	"github.com/go-rio/rio"
-	"github.com/go-rio/sqlite"
-)
-
 db, err := sqlite.Open("app.db")
 if err != nil {
 	log.Fatal(err)
@@ -33,62 +28,44 @@ users, err := rio.From[User]().Where("age > ?", 18).All(ctx, db)
 
 ## DSN defaults
 
-`Open` appends two pragmas and one driver parameter unless the DSN already sets
-that key:
+`Open` appends these unless the DSN already sets the key; explicit values
+win. `New` wraps an existing `*sql.DB` and does not modify the DSN.
 
-| Parameter | Default | Why |
+| Parameter | Default | Effect |
 |---|---|---|
-| `_pragma=foreign_keys` | `1` | Enforces foreign keys and enables `rio.ErrForeignKeyViolated` translation. |
-| `_pragma=busy_timeout` | `5000` | Waits up to five seconds on a locked database before returning `SQLITE_BUSY`. |
-| `_time_format` | `sqlite` | Makes `time.Time` values bound directly through `database/sql` readable by SQLite date functions. |
+| `_pragma=foreign_keys` | `1` | Enforces foreign keys; enables `rio.ErrForeignKeyViolated` translation. |
+| `_pragma=busy_timeout` | `5000` | Waits up to five seconds on a locked database before `SQLITE_BUSY`. |
+| `_time_format` | `sqlite` | Makes directly bound `time.Time` values readable by SQLite date functions. |
 
-Explicit values win:
+rio encodes its own `time.Time` writes independently. `_texttotime` and
+`_inttotime` stay opt-in because they can turn an `INTEGER` scan value into
+`time.Time`.
 
-```go
-db, err := sqlite.Open("app.db?_pragma=busy_timeout(10000)")
-```
+## Pools and write behavior
 
-rio encodes its own `time.Time` writes independently. `Open` leaves
-`_texttotime` and `_inttotime` opt-in because they can turn an `INTEGER` scan
-value into `time.Time`. `New` does not modify the DSN.
-
-## Pools and in-memory databases
-
-`Open` and `New` leave connection limits to the caller. Use
-`sqlite.New(sqlDB)` to wrap an existing `*sql.DB` without changing it.
-
-A plain `:memory:` DSN gives each pooled connection its own private empty
-database. Use a shared-cache DSN and one open connection when all operations
-must see the same in-memory state:
+`Open` and `New` leave connection limits to the caller. A plain `:memory:`
+DSN gives each pooled connection its own private empty database; to share
+one in-memory database, use a shared-cache DSN and one connection:
 
 ```go
 db, _ := sqlite.Open("file:app?mode=memory&cache=shared")
 db.Unwrap().SetMaxOpenConns(1)
 ```
 
-## SQLite write behavior
-
-SQLite permits one writer at a time. A single connection serializes writes:
-
-```go
-db.Unwrap().SetMaxOpenConns(1)
-```
-
-For concurrent readers and writers, use a file-backed database with immediate
-write transactions, WAL, and a suitable busy timeout:
+SQLite permits one writer at a time; a single connection serializes writes.
+For concurrent readers and writers, use a file-backed database with
+immediate write transactions, WAL, and a longer busy timeout:
 
 ```go
-db, err := sqlite.Open(
-	"app.db?_txlock=immediate&_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)",
-)
+db, err := sqlite.Open("app.db?_txlock=immediate&_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)")
 ```
 
-WAL is persistent and creates `-wal` and `-shm` sidecar files, so `Open` does
-not enable it by default; check filesystem support before using it.
+WAL is persistent and creates `-wal`/`-shm` sidecar files, so `Open` does
+not enable it by default; check filesystem support first.
 
-rio's SQLite dialect omits `FOR UPDATE` because SQLite locks writes at the
-database level. A single insert uses `LastInsertId` when only its generated key
-needs backfill and keeps `RETURNING` for omitted default columns. Upserts use
+The dialect omits `FOR UPDATE` because SQLite locks writes at the database
+level. A single insert uses `LastInsertId` when only its generated key needs
+backfill and `RETURNING` for omitted default columns. Upserts use
 `ON CONFLICT`.
 
 ## Error translation
@@ -98,7 +75,7 @@ needs backfill and keeps `RETURNING` for omitted default columns. Upserts use
 | Unique or primary key violation | `rio.ErrDuplicateKey` |
 | Foreign key violation | `rio.ErrForeignKeyViolated` |
 
-The driver's `*sqlite.Error` remains available through `errors.As`.
+The driver's `*sqlite.Error` stays available through `errors.As`.
 
 ## Contributing
 

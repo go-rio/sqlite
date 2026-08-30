@@ -39,8 +39,7 @@ CREATE TABLE posts (
 	title   TEXT NOT NULL
 );`
 
-// Keep in-memory test databases on one connection because each connection has
-// its own database.
+// One connection: each connection gets its own in-memory database.
 func openTestDB(t *testing.T, dsn string) *rio.DB {
 	t.Helper()
 	db, err := Open(dsn)
