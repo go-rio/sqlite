@@ -17,9 +17,10 @@ import (
 
 const driverName = "sqlite"
 
-// Open opens a SQLite database with the rio.SQLite dialect and SQLite error
-// translation. It adds foreign_keys(1), busy_timeout(5000), and
-// _time_format=sqlite unless the DSN already specifies them. Invalid paths
+// Open opens a SQLite database with the rio.SQLite dialect, SQLite error
+// translation, and the prepared-statement cache (see New). It adds
+// foreign_keys(1), busy_timeout(5000), _time_format=sqlite, _timezone=UTC,
+// and _txlock=immediate unless the DSN already specifies them. Invalid paths
 // and DSNs surface on first use or Ping.
 //
 // Each connection to a plain ":memory:" database is isolated; to share one,
@@ -32,12 +33,14 @@ func Open(dsn string, opts ...rio.Option) (*rio.DB, error) {
 	return New(db, opts...), nil
 }
 
-// New wraps db with the rio.SQLite dialect and SQLite error translation. It
-// does not configure the pool or enable foreign key enforcement. A
-// rio.WithErrorTranslator option overrides the built-in translator.
+// New wraps db with the rio.SQLite dialect, SQLite error translation, and
+// rio's prepared-statement cache. It does not configure the pool or enable
+// foreign key enforcement. Later options win: rio.WithErrorTranslator
+// replaces the built-in translator and rio.WithoutStmtCache disables the
+// cache.
 func New(db *sql.DB, opts ...rio.Option) *rio.DB {
-	return rio.New(db, rio.SQLite,
-		append([]rio.Option{rio.WithErrorTranslator(translate)}, opts...)...)
+	defaults := []rio.Option{rio.WithErrorTranslator(translate), rio.WithStmtCache()}
+	return rio.New(db, rio.SQLite, append(defaults, opts...)...)
 }
 
 // translate maps constraint errors to rio sentinels, nil otherwise.
@@ -48,7 +51,8 @@ func translate(err error) error {
 	}
 	switch se.Code() {
 	case sqlite3.SQLITE_CONSTRAINT_UNIQUE,
-		sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY:
+		sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY,
+		sqlite3.SQLITE_CONSTRAINT_ROWID:
 		return rio.ErrDuplicateKey
 	case sqlite3.SQLITE_CONSTRAINT_FOREIGNKEY:
 		return rio.ErrForeignKeyViolated
@@ -59,10 +63,12 @@ func translate(err error) error {
 // The driver applies these to every connection.
 var defaultPragmas = [...]string{"busy_timeout(5000)", "foreign_keys(1)"}
 
-// _time_format=sqlite makes bound time.Time readable by SQLite date functions;
-// read-side conversion stays opt-in (it can turn INTEGER scans into time.Time).
+// Applied unless the DSN sets them: bound time.Time is written as SQLite text
+// at UTC, and transactions begin with the write lock.
 var defaultParams = [...][2]string{
 	{"_time_format", "sqlite"},
+	{"_timezone", "UTC"},
+	{"_txlock", "immediate"},
 }
 
 // withDefaultPragmas appends missing defaults without overriding explicit

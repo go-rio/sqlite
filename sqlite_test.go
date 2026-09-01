@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/go-rio/rio"
 	driver "modernc.org/sqlite"
@@ -47,6 +48,23 @@ func openTestDB(t *testing.T, dsn string) *rio.DB {
 		t.Fatalf("Open(%q): %v", dsn, err)
 	}
 	db.Unwrap().SetMaxOpenConns(1)
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+	return db
+}
+
+// wrapTestDB opens dsn without Open's DSN defaults and wraps it with New.
+func wrapTestDB(t *testing.T, dsn string, opts ...rio.Option) *rio.DB {
+	t.Helper()
+	sqlDB, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("sql.Open(%q): %v", dsn, err)
+	}
+	sqlDB.SetMaxOpenConns(1)
+	db := New(sqlDB, opts...)
 	t.Cleanup(func() {
 		if err := db.Close(); err != nil {
 			t.Errorf("Close: %v", err)
@@ -120,6 +138,23 @@ func TestDuplicateKeyTranslation(t *testing.T) {
 	if err := rio.Insert(ctx, db, &pkDup); !errors.Is(err, rio.ErrDuplicateKey) {
 		t.Fatalf("duplicate primary key: got %v, want rio.ErrDuplicateKey", err)
 	}
+
+	// Without an INTEGER PRIMARY KEY alias, a duplicate rowid is its own code.
+	mustExec(t, db, "CREATE TABLE notes (body TEXT NOT NULL)")
+	const note = "INSERT INTO notes (rowid, body) VALUES (1, 'note')"
+	if _, err := rio.Exec(ctx, db, note); err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	_, err = rio.Exec(ctx, db, note)
+	if !errors.Is(err, rio.ErrDuplicateKey) {
+		t.Fatalf("duplicate rowid: got %v, want rio.ErrDuplicateKey", err)
+	}
+	if !errors.As(err, &de) {
+		t.Fatalf("duplicate rowid: driver error missing from chain: %v", err)
+	}
+	if de.Code() != sqlite3.SQLITE_CONSTRAINT_ROWID {
+		t.Fatalf("duplicate rowid: driver code = %d, want %d", de.Code(), sqlite3.SQLITE_CONSTRAINT_ROWID)
+	}
 }
 
 func TestForeignKeysEnforced(t *testing.T) {
@@ -147,7 +182,7 @@ func TestConcurrentWrites(t *testing.T) {
 
 	// Use a file-backed database so writers contend over shared state.
 	db, err := Open(filepath.Join(t.TempDir(), "concurrent.db") +
-		"?_txlock=immediate&_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)")
+		"?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)")
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -234,17 +269,7 @@ func TestNewInstallsTranslator(t *testing.T) {
 	ctx := context.Background()
 
 	// New does not configure an existing pool, so enable foreign keys here.
-	sqlDB, err := sql.Open("sqlite", ":memory:?_pragma=foreign_keys(1)")
-	if err != nil {
-		t.Fatalf("sql.Open: %v", err)
-	}
-	sqlDB.SetMaxOpenConns(1)
-	db := New(sqlDB)
-	t.Cleanup(func() {
-		if err := db.Close(); err != nil {
-			t.Errorf("Close: %v", err)
-		}
-	})
+	db := wrapTestDB(t, ":memory:?_pragma=foreign_keys(1)")
 	mustExec(t, db, testSchema)
 
 	alice := user{Email: "alice@example.com", Name: "Alice"}
@@ -258,6 +283,24 @@ func TestNewInstallsTranslator(t *testing.T) {
 	orphan := post{UserID: 9001, Title: "orphan"}
 	if err := rio.Insert(ctx, db, &orphan); !errors.Is(err, rio.ErrForeignKeyViolated) {
 		t.Fatalf("orphan insert: got %v, want rio.ErrForeignKeyViolated", err)
+	}
+}
+
+func TestNewWithoutStmtCache(t *testing.T) {
+	ctx := context.Background()
+	db := wrapTestDB(t, ":memory:", rio.WithoutStmtCache())
+	mustExec(t, db, testSchema)
+
+	alice := user{Email: "alice@example.com", Name: "Alice"}
+	if err := rio.Insert(ctx, db, &alice); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	got, err := rio.Find[user](ctx, db, alice.ID)
+	if err != nil {
+		t.Fatalf("Find: %v", err)
+	}
+	if *got != alice {
+		t.Fatalf("Find returned %+v, want %+v", *got, alice)
 	}
 }
 
@@ -288,24 +331,98 @@ func TestOpenPragmaDefaultsAndOverrides(t *testing.T) {
 	}
 }
 
-const times = "&_time_format=sqlite"
+func TestOpenBindsTimesInUTC(t *testing.T) {
+	at := time.Date(2024, 1, 2, 3, 4, 5, 0, time.FixedZone("UTC+8", 8*3600))
+	const layout = "2006-01-02 15:04:05.999999999-07:00"
+	tests := []struct {
+		name string
+		dsn  string
+		want string
+	}{
+		{"default UTC", ":memory:", "2024-01-01 19:04:05+00:00"},
+		{"user timezone wins", ":memory:?_timezone=Local", at.In(time.Local).Format(layout)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := openTestDB(t, tt.dsn)
+			mustExec(t, db, "CREATE TABLE stamps (at TEXT NOT NULL)")
+			if _, err := db.Unwrap().Exec("INSERT INTO stamps (at) VALUES (?)", at); err != nil {
+				t.Fatalf("Exec: %v", err)
+			}
+			var got string
+			if err := db.Unwrap().QueryRow("SELECT at FROM stamps").Scan(&got); err != nil {
+				t.Fatalf("Scan: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("stored %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestOpenBeginsImmediate(t *testing.T) {
+	tests := []struct {
+		name     string
+		params   string
+		wantBusy bool
+	}{
+		{"default immediate", "", true},
+		{"user txlock wins", "&_txlock=deferred", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			// A zero busy timeout fails a contended BEGIN instead of waiting.
+			db, err := Open(filepath.Join(t.TempDir(), "lock.db") + "?_pragma=busy_timeout(0)" + tt.params)
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			t.Cleanup(func() {
+				if err := db.Close(); err != nil {
+					t.Errorf("Close: %v", err)
+				}
+			})
+
+			holder, err := db.Unwrap().BeginTx(ctx, nil)
+			if err != nil {
+				t.Fatalf("first BeginTx: %v", err)
+			}
+			t.Cleanup(func() { _ = holder.Rollback() })
+			contender, err := db.Unwrap().BeginTx(ctx, nil)
+			if err == nil {
+				t.Cleanup(func() { _ = contender.Rollback() })
+			}
+			var de *driver.Error
+			gotBusy := errors.As(err, &de) && de.Code() == sqlite3.SQLITE_BUSY
+			if gotBusy != tt.wantBusy {
+				t.Fatalf("second BeginTx: err = %v, want busy = %t", err, tt.wantBusy)
+			}
+		})
+	}
+}
+
+const params = "&_time_format=sqlite&_timezone=UTC&_txlock=immediate"
 
 func TestWithDefaultPragmas(t *testing.T) {
 	tests := []struct {
 		dsn  string
 		want string
 	}{
-		{"", "file:?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)" + times},
-		{":memory:", ":memory:?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)" + times},
-		{"app.db", "app.db?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)" + times},
-		{"file:app.db?mode=ro", "file:app.db?mode=ro&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)" + times},
-		{"app.db?", "app.db?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)" + times},
-		{"app.db?_pragma=foreign_keys(0)", "app.db?_pragma=foreign_keys(0)&_pragma=busy_timeout(5000)" + times},
-		{"app.db?_pragma=busy_timeout(1)&_pragma=foreign_keys(1)", "app.db?_pragma=busy_timeout(1)&_pragma=foreign_keys(1)" + times},
-		{"app.db?_pragma=busy_timeout%285000%29", "app.db?_pragma=busy_timeout%285000%29&_pragma=foreign_keys(1)" + times},
-		{"app.db?_pragma=foreign_keys+%3D+ON", "app.db?_pragma=foreign_keys+%3D+ON&_pragma=busy_timeout(5000)" + times},
+		{"", "file:?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)" + params},
+		{":memory:", ":memory:?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)" + params},
+		{"app.db", "app.db?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)" + params},
+		{"file:app.db?mode=ro", "file:app.db?mode=ro&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)" + params},
+		{"app.db?", "app.db?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)" + params},
+		{"app.db?_pragma=foreign_keys(0)", "app.db?_pragma=foreign_keys(0)&_pragma=busy_timeout(5000)" + params},
+		{"app.db?_pragma=busy_timeout(1)&_pragma=foreign_keys(1)", "app.db?_pragma=busy_timeout(1)&_pragma=foreign_keys(1)" + params},
+		{"app.db?_pragma=busy_timeout%285000%29", "app.db?_pragma=busy_timeout%285000%29&_pragma=foreign_keys(1)" + params},
+		{"app.db?_pragma=foreign_keys+%3D+ON", "app.db?_pragma=foreign_keys+%3D+ON&_pragma=busy_timeout(5000)" + params},
 		{"app.db?_time_format=sqlite",
-			"app.db?_time_format=sqlite&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"},
+			"app.db?_time_format=sqlite&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_timezone=UTC&_txlock=immediate"},
+		{"app.db?_timezone=Local",
+			"app.db?_timezone=Local&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_time_format=sqlite&_txlock=immediate"},
+		{"app.db?_txlock=deferred",
+			"app.db?_txlock=deferred&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_time_format=sqlite&_timezone=UTC"},
 		{"?weird", "?weird"},
 		{"app.db?_pragma=%zz", "app.db?_pragma=%zz"},
 	}

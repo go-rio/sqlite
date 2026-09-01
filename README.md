@@ -36,6 +36,8 @@ win. `New` wraps an existing `*sql.DB` and does not modify the DSN.
 | `_pragma=foreign_keys` | `1` | Enforces foreign keys; enables `rio.ErrForeignKeyViolated` translation. |
 | `_pragma=busy_timeout` | `5000` | Waits up to five seconds on a locked database before `SQLITE_BUSY`. |
 | `_time_format` | `sqlite` | Makes directly bound `time.Time` values readable by SQLite date functions. |
+| `_timezone` | `UTC` | Converts directly bound `time.Time` values to UTC before writing, so stored offsets stay uniform. |
+| `_txlock` | `immediate` | Takes the write lock at `BEGIN`, so writers wait on `busy_timeout` instead of failing a deferred lock upgrade with `SQLITE_BUSY`. |
 
 rio encodes its own `time.Time` writes independently. `_texttotime` and
 `_inttotime` stay opt-in because they can turn an `INTEGER` scan value into
@@ -53,11 +55,11 @@ db.Unwrap().SetMaxOpenConns(1)
 ```
 
 SQLite permits one writer at a time; a single connection serializes writes.
-For concurrent readers and writers, use a file-backed database with
-immediate write transactions, WAL, and a longer busy timeout:
+For concurrent readers and writers, use a file-backed database with WAL and
+a longer busy timeout:
 
 ```go
-db, err := sqlite.Open("app.db?_txlock=immediate&_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)")
+db, err := sqlite.Open("app.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)")
 ```
 
 WAL is persistent and creates `-wal`/`-shm` sidecar files, so `Open` does
@@ -68,11 +70,21 @@ level. A single insert uses `LastInsertId` when only its generated key needs
 backfill and `RETURNING` for omitted default columns. Upserts use
 `ON CONFLICT`.
 
+## Statement reuse
+
+`Open` and `New` enable rio's bounded prepared-statement cache (one per
+`*rio.DB` plus one per transaction); without it the driver re-prepares every
+statement. Pass `rio.WithoutStmtCache()` to opt out:
+
+```go
+db, err := sqlite.Open("app.db", rio.WithoutStmtCache())
+```
+
 ## Error translation
 
 | SQLite error | rio error |
 |---|---|
-| Unique or primary key violation | `rio.ErrDuplicateKey` |
+| Unique, primary key, or rowid violation | `rio.ErrDuplicateKey` |
 | Foreign key violation | `rio.ErrForeignKeyViolated` |
 
 The driver's `*sqlite.Error` stays available through `errors.As`.
