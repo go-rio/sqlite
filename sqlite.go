@@ -17,6 +17,17 @@ import (
 
 const driverName = "sqlite"
 
+// The driver applies these to every connection.
+var defaultPragmas = [...]string{"busy_timeout(5000)", "foreign_keys(1)"}
+
+// Applied unless the DSN sets them: bound time.Time is written as SQLite text
+// at UTC, and transactions begin with the write lock.
+var defaultParams = [...][2]string{
+	{"_time_format", "sqlite"},
+	{"_timezone", "UTC"},
+	{"_txlock", "immediate"},
+}
+
 // Open opens a SQLite database with the rio.SQLite dialect, SQLite error
 // translation, and the prepared-statement cache (see New). It adds
 // foreign_keys(1), busy_timeout(5000), _time_format=sqlite, _timezone=UTC,
@@ -41,34 +52,6 @@ func Open(dsn string, opts ...rio.Option) (*rio.DB, error) {
 func New(db *sql.DB, opts ...rio.Option) *rio.DB {
 	defaults := []rio.Option{rio.WithErrorTranslator(translate), rio.WithStmtCache()}
 	return rio.New(db, rio.SQLite, append(defaults, opts...)...)
-}
-
-// translate maps constraint errors to rio sentinels, nil otherwise.
-func translate(err error) error {
-	var se *driver.Error
-	if !errors.As(err, &se) {
-		return nil
-	}
-	switch se.Code() {
-	case sqlite3.SQLITE_CONSTRAINT_UNIQUE,
-		sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY,
-		sqlite3.SQLITE_CONSTRAINT_ROWID:
-		return rio.ErrDuplicateKey
-	case sqlite3.SQLITE_CONSTRAINT_FOREIGNKEY:
-		return rio.ErrForeignKeyViolated
-	}
-	return nil
-}
-
-// The driver applies these to every connection.
-var defaultPragmas = [...]string{"busy_timeout(5000)", "foreign_keys(1)"}
-
-// Applied unless the DSN sets them: bound time.Time is written as SQLite text
-// at UTC, and transactions begin with the write lock.
-var defaultParams = [...][2]string{
-	{"_time_format", "sqlite"},
-	{"_timezone", "UTC"},
-	{"_txlock", "immediate"},
 }
 
 // withDefaultPragmas appends missing defaults without overriding explicit
@@ -122,9 +105,10 @@ func withDefaultPragmas(dsn string) string {
 	return dsn + sep + strings.Join(add, "&")
 }
 
+// pragmaName extracts the lower-cased name from a "name(value)" pragma entry.
 func pragmaName(v string) string {
 	v = strings.TrimSpace(v)
-	for i := 0; i < len(v); i++ {
+	for i := range len(v) {
 		c := v[i]
 		isLetter := c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
 		isDigit := c >= '0' && c <= '9'
@@ -135,4 +119,21 @@ func pragmaName(v string) string {
 		break
 	}
 	return strings.ToLower(v)
+}
+
+// translate maps constraint errors to rio sentinels, nil otherwise.
+func translate(err error) error {
+	var se *driver.Error
+	if !errors.As(err, &se) {
+		return nil
+	}
+	switch se.Code() {
+	case sqlite3.SQLITE_CONSTRAINT_UNIQUE,
+		sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY,
+		sqlite3.SQLITE_CONSTRAINT_ROWID:
+		return rio.ErrDuplicateKey
+	case sqlite3.SQLITE_CONSTRAINT_FOREIGNKEY:
+		return rio.ErrForeignKeyViolated
+	}
+	return nil
 }

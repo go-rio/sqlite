@@ -8,7 +8,21 @@
 
 SQLite driver module for [rio](https://github.com/go-rio/rio), backed by the
 pure-Go [modernc.org/sqlite](https://pkg.go.dev/modernc.org/sqlite) driver:
-connection defaults plus error translation; rio owns SQL rendering.
+connection defaults, error translation, and a prepared-statement cache that
+is on by default. rio renders the SQL.
+
+```go
+db, err := sqlite.Open("app.db")
+if err != nil {
+	return err
+}
+defer db.Close()
+
+if err := rio.Insert(ctx, db, &User{Email: "a@example.com", Age: 30}); err != nil {
+	return err
+}
+users, err := rio.From[User]().Where("age > ?", 18).All(ctx, db)
+```
 
 ## Getting started
 
@@ -17,19 +31,56 @@ go get github.com/go-rio/sqlite
 ```
 
 ```go
-db, err := sqlite.Open("app.db")
-if err != nil {
-	log.Fatal(err)
-}
-defer db.Close()
+package main
 
-users, err := rio.From[User]().Where("age > ?", 18).All(ctx, db)
+import (
+	"context"
+	"log"
+
+	"github.com/go-rio/rio"
+	"github.com/go-rio/sqlite"
+)
+
+type User struct {
+	ID    int64
+	Email string
+	Age   int
+}
+
+func main() {
+	ctx := context.Background()
+	db, err := sqlite.Open("app.db")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := rio.Insert(ctx, db, &User{Email: "a@example.com", Age: 30}); err != nil {
+		log.Fatal(err)
+	}
+	users, err := rio.From[User]().Where("age > ?", 18).All(ctx, db)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("%d adults", len(users))
+}
 ```
 
-## DSN defaults
+Requires Go 1.27; the driver is pure Go, so no C toolchain is involved.
+
+## Features
+
+### Constructors
+
+`Open` appends the DSN defaults below, installs the error translator and the
+statement cache, and does not connect: invalid paths surface on first use or
+`db.Unwrap().Ping()`. `New` wraps an existing `*sql.DB` with the same dialect,
+translator, and cache and does not modify the DSN.
+
+### DSN defaults
 
 `Open` appends these unless the DSN already sets the key; explicit values
-win. `New` wraps an existing `*sql.DB` and does not modify the DSN.
+win.
 
 | Parameter | Default | Effect |
 |---|---|---|
@@ -39,11 +90,16 @@ win. `New` wraps an existing `*sql.DB` and does not modify the DSN.
 | `_timezone` | `UTC` | Converts directly bound `time.Time` values to UTC before writing, so stored offsets stay uniform. |
 | `_txlock` | `immediate` | Takes the write lock at `BEGIN`, so writers wait on `busy_timeout` instead of failing a deferred lock upgrade with `SQLITE_BUSY`. |
 
-rio encodes its own `time.Time` writes independently. `_texttotime` and
-`_inttotime` stay opt-in because they can turn an `INTEGER` scan value into
-`time.Time`.
+### Time values
 
-## Pools and write behavior
+rio writes its own `time.Time` values as `2006-01-02 15:04:05.999999+00:00`
+text at UTC and reads that form back; the `_time_format` and `_timezone`
+defaults make values bound through `db.Unwrap()` or a `driver.Valuer` land in
+the same shape, so one `TEXT` column sorts and compares consistently.
+`_texttotime` and `_inttotime` stay opt-in because they can turn an `INTEGER`
+scan value into `time.Time`.
+
+### Pools and write behavior
 
 `Open` and `New` leave connection limits to the caller. A plain `:memory:`
 DSN gives each pooled connection its own private empty database; to share
@@ -65,12 +121,7 @@ db, err := sqlite.Open("app.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(10
 WAL is persistent and creates `-wal`/`-shm` sidecar files, so `Open` does
 not enable it by default; check filesystem support first.
 
-The dialect omits `FOR UPDATE` because SQLite locks writes at the database
-level. A single insert uses `LastInsertId` when only its generated key needs
-backfill and `RETURNING` for omitted default columns. Upserts use
-`ON CONFLICT`.
-
-## Statement reuse
+### Statement reuse
 
 `Open` and `New` enable rio's bounded prepared-statement cache (one per
 `*rio.DB` plus one per transaction); without it the driver re-prepares every
@@ -80,7 +131,17 @@ statement. Pass `rio.WithoutStmtCache()` to opt out:
 db, err := sqlite.Open("app.db", rio.WithoutStmtCache())
 ```
 
-## Error translation
+### Dialect behavior
+
+Row locks (`ForUpdate`, `ForShare`) are elided because SQLite locks writes
+at the database level. A single insert uses `LastInsertId` when only its
+generated key needs backfill and `RETURNING` when omitted default or
+readonly columns must be loaded; `InsertAll` backfills keys through
+`RETURNING`, and `UpdateAllReturning`/`DeleteAllReturning` are available.
+Upserts use `ON CONFLICT`. The bind ceiling is 999 parameters, so large key
+sets chunk.
+
+### Error translation
 
 | SQLite error | rio error |
 |---|---|
@@ -91,9 +152,14 @@ The driver's `*sqlite.Error` stays available through `errors.As`.
 
 ## Contributing
 
-Use Go 1.27 or newer, then run `go test ./...`, `go test -race ./...`, and
-`go vet ./...` before opening a pull request.
+Read [CONTRIBUTING.md](CONTRIBUTING.md): a clone and `go test ./...` is the
+whole setup; the suite runs in-process.
+
+## Contributors
+
+Thanks to everyone who has filed issues and opened pull requests on
+[go-rio/sqlite](https://github.com/go-rio/sqlite/graphs/contributors).
 
 ## License
 
-[MIT](LICENSE)
+The [MIT License](LICENSE). Copyright (c) 2026-now TreeNewBee.
