@@ -3,7 +3,7 @@ module github.com/go-rio/sqlite
 go 1.27.0
 
 require (
-	github.com/go-rio/rio v0.13.0
+	github.com/go-rio/rio v0.16.0
 	modernc.org/sqlite v1.57.0
 )
 
@@ -18,5 +18,3 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.12.0 // indirect
 )
-
-replace github.com/go-rio/rio => ../rio
