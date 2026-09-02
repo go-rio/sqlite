@@ -2,7 +2,6 @@ package sqlite_test
 
 import (
 	"context"
-	"database/sql"
 	"log"
 
 	"github.com/go-rio/rio"
@@ -33,35 +32,37 @@ func ExampleOpen() {
 	log.Printf("%d adults", len(users))
 }
 
-// A plain ":memory:" DSN gives every pooled connection its own database;
-// the shared-cache form with one connection is the test-suite shape.
+// A plain ":memory:" DSN is private to its single connection; the
+// shared-cache form is reachable from OpenSQL and Unwrap as well.
 func ExampleOpen_sharedMemory() {
 	db, err := sqlite.Open("file:app?mode=memory&cache=shared")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
-	db.Unwrap().SetMaxOpenConns(1)
 }
 
 // WAL lets readers proceed while one writer holds the lock; a longer busy
-// timeout keeps queued writers waiting instead of failing.
+// timeout keeps queued writers waiting instead of failing, and the pool cap
+// bounds how many connections contend.
 func ExampleOpen_wal() {
-	db, err := sqlite.Open("app.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)")
+	db, err := sqlite.Open("app.db?_journal_mode=WAL&_busy_timeout=10000")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
+	sqlite.PoolOf(db).SetMaxConns(8)
 }
 
-// New wraps a pool the caller opened; the DSN defaults are the caller's
-// responsibility.
-func ExampleNew() {
-	raw, err := sql.Open("sqlite", "app.db?_pragma=foreign_keys(1)")
+// OpenSQL is the plain database/sql handle go-rio/migrate consumes.
+func ExampleOpenSQL() {
+	sqlDB, err := sqlite.OpenSQL("app.db")
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer sqlDB.Close()
 
-	db := sqlite.New(raw, rio.WithoutStmtCache())
-	defer db.Close()
+	if _, err := sqlDB.Exec("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, email TEXT, age INTEGER)"); err != nil {
+		log.Fatal(err)
+	}
 }

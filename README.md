@@ -6,10 +6,13 @@
 [![Test](https://github.com/go-rio/sqlite/actions/workflows/test.yml/badge.svg)](https://github.com/go-rio/sqlite/actions/workflows/test.yml)
 [![License](https://img.shields.io/github/license/go-rio/sqlite)](https://opensource.org/license/MIT)
 
-SQLite driver module for [rio](https://github.com/go-rio/rio), backed by the
-pure-Go [modernc.org/sqlite](https://pkg.go.dev/modernc.org/sqlite) driver:
-connection defaults, error translation, and a prepared-statement cache that
-is on by default. rio renders the SQL.
+SQLite driver module for [rio](https://github.com/go-rio/rio). It drives the
+pure-Go [modernc.org/sqlite](https://pkg.go.dev/modernc.org/sqlite) library
+directly on rio's native channel: no database/sql in the path, a
+prepared-statement cache on every connection, and rows decoded by storage
+class straight into rio's scan cells. `OpenSQL` adds a thin database/sql
+handle for tools such as [go-rio/migrate](https://github.com/go-rio/migrate).
+rio renders the SQL.
 
 ```go
 db, err := sqlite.Open("app.db")
@@ -66,76 +69,92 @@ func main() {
 }
 ```
 
-Requires Go 1.27; the driver is pure Go, so no C toolchain is involved.
+Requires Go 1.27; the library is pure Go, so no C toolchain is involved.
 
 ## Features
 
 ### Constructors
 
-`Open` appends the DSN defaults below, installs the error translator and the
-statement cache, and does not connect: invalid paths surface on first use or
-`db.Unwrap().Ping()`. `New` wraps an existing `*sql.DB` with the same dialect,
-translator, and cache and does not modify the DSN.
+`Open` parses the DSN and returns a `*rio.DB` on rio's native channel.
+Nothing opens until first use, so an invalid path surfaces then.
+`rio.WithStmtCache` is unsupported: every connection already caches its
+prepared statements.
 
-### DSN defaults
+`OpenSQL` returns a plain `*sql.DB` over the same connection layer, one
+SQLite connection per database/sql connection. Transactions, prepared
+statements, affected-row counts, and `LastInsertId` behave as with any
+driver. `db.Unwrap()` on an `Open` handle serves the same kind of view with
+connections of its own, and is nil for private memory and temporary
+databases, which no second connection can reach.
 
-`Open` appends these unless the DSN already sets the key; explicit values
-win.
+### DSN
 
-| Parameter | Default | Effect |
-|---|---|---|
-| `_pragma=foreign_keys` | `1` | Enforces foreign keys; enables `rio.ErrForeignKeyViolated` translation. |
-| `_pragma=busy_timeout` | `5000` | Waits up to five seconds on a locked database before `SQLITE_BUSY`. |
-| `_time_format` | `sqlite` | Makes directly bound `time.Time` values readable by SQLite date functions. |
-| `_timezone` | `UTC` | Converts directly bound `time.Time` values to UTC before writing, so stored offsets stay uniform. |
-| `_txlock` | `immediate` | Takes the write lock at `BEGIN`, so writers wait on `busy_timeout` instead of failing a deferred lock upgrade with `SQLITE_BUSY`. |
+A path, `:memory:`, or a `file:` URI. SQLite reads the URI parameters
+(`mode`, `cache`, `vfs`, `immutable`, ...). The module reads these:
 
-### Time values
+| Parameter | Effect |
+|---|---|
+| `_pragma=name(value)` | Runs `PRAGMA name(value)` on every new connection; repeatable. |
+| `_txlock` | `BEGIN` mode of read-write transactions: `immediate` (default), `deferred`, or `exclusive`. |
+| `_busy_timeout` (`_timeout`), `_auto_vacuum` (`_vacuum`), `_foreign_keys` (`_fk`), `_journal_mode` (`_journal`), `_synchronous` (`_sync`), `_query_only` | Shorthand for the pragma of the same name. |
 
-rio writes its own `time.Time` values as `2006-01-02 15:04:05.999999+00:00`
-text at UTC and reads that form back; the `_time_format` and `_timezone`
-defaults make values bound through `db.Unwrap()` or a `driver.Valuer` land in
-the same shape, so one `TEXT` column sorts and compares consistently.
-`_texttotime` and `_inttotime` stay opt-in because they can turn an `INTEGER`
-scan value into `time.Time`.
+`busy_timeout(5000)` and `foreign_keys(1)` apply unless the DSN sets them
+through either form. Pragmas run in the modernc driver's order:
+`busy_timeout`, `auto_vacuum`, the `_pragma` list, `foreign_keys`,
+`journal_mode`, `synchronous`, `query_only`. Any other underscore parameter
+is rejected.
 
-### Pools and write behavior
+### Connections
 
-`Open` and `New` leave connection limits to the caller. A plain `:memory:`
-DSN gives each pooled connection its own private empty database; to share
-one in-memory database, use a shared-cache DSN and one connection:
+Connections open on demand up to `PoolOf(db).MaxConns()`, `GOMAXPROCS` by
+default, and stay open with their statement caches; `SetMaxConns` changes
+the cap at any time, and acquirers beyond it wait in arrival order until
+their context ends. Private memory databases (`:memory:`, `mode=memory`),
+temporary databases (an empty DSN), and shared-cache DSNs run on one
+connection: a second connection would reach a different database, or
+contend on shared-cache locks the module does not retry.
 
-```go
-db, _ := sqlite.Open("file:app?mode=memory&cache=shared")
-db.Unwrap().SetMaxOpenConns(1)
-```
-
-SQLite permits one writer at a time; a single connection serializes writes.
-For concurrent readers and writers, use a file-backed database with WAL and
-a longer busy timeout:
-
-```go
-db, err := sqlite.Open("app.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)")
-```
-
-WAL is persistent and creates `-wal`/`-shm` sidecar files, so `Open` does
-not enable it by default; check filesystem support first.
-
-### Statement reuse
-
-`Open` and `New` enable rio's bounded prepared-statement cache (one per
-`*rio.DB` plus one per transaction); without it the driver re-prepares every
-statement. Pass `rio.WithoutStmtCache()` to opt out:
+SQLite permits one writer at a time. For concurrent readers and writers,
+use a file-backed database with WAL and a longer busy timeout:
 
 ```go
-db, err := sqlite.Open("app.db", rio.WithoutStmtCache())
+db, err := sqlite.Open("app.db?_journal_mode=WAL&_busy_timeout=10000")
+sqlite.PoolOf(db).SetMaxConns(8)
 ```
+
+WAL is persistent and creates `-wal`/`-shm` sidecar files, so it is not on
+by default; check filesystem support first.
+
+### Transactions and cancellation
+
+Transactions begin in the DSN's `_txlock` mode, so writers wait on
+`busy_timeout` at `BEGIN` instead of failing a deferred lock upgrade with
+`SQLITE_BUSY`; read-only transactions begin deferred. Every isolation level
+is accepted, SQLite being serializable. A `COMMIT` that fails leaves the
+transaction open in SQLite, so the connection rolls back before it returns
+to the pool. Nested `rio.Tx` calls are savepoints.
+
+A canceled context interrupts the running statement through
+`sqlite3_interrupt`; the statement reports the context's error.
+
+### Values
+
+Arguments bind as SQLite storage classes: integers, floats, text, blobs,
+`bool` as 0/1, `time.Time` as `2006-01-02 15:04:05.999999+00:00` text at
+UTC, nil as NULL; other Go types go through database/sql's default
+conversion first (`driver.Valuer`, pointers, narrower integers).
+
+Rows decode by storage class. TEXT read into a `time.Time` field, or from a
+column declared `DATE`, `DATETIME`, or `TIMESTAMP`, parses SQLite's
+date-time forms (a date, with an optional time, fraction, and `Z` or `±HH:MM`
+offset) to UTC; other text stays a string. Blobs are copied into the
+destination.
 
 ### Dialect behavior
 
 Row locks (`ForUpdate`, `ForShare`) are elided because SQLite locks writes
-at the database level. A single insert uses `LastInsertId` when only its
-generated key needs backfill and `RETURNING` when omitted default or
+at the database level. A single insert backfills a lone generated key from
+`sqlite3_last_insert_rowid` and uses `RETURNING` when omitted default or
 readonly columns must be loaded; `InsertAll` backfills keys through
 `RETURNING`, and `UpdateAllReturning`/`DeleteAllReturning` are available.
 Upserts use `ON CONFLICT`. The bind ceiling is 999 parameters, so large key
@@ -148,7 +167,18 @@ sets chunk.
 | Unique, primary key, or rowid violation | `rio.ErrDuplicateKey` |
 | Foreign key violation | `rio.ErrForeignKeyViolated` |
 
-The driver's `*sqlite.Error` stays available through `errors.As`.
+Every SQLite failure is a `*sqlite.Error` reachable through `errors.As`;
+`Code` is the extended result code.
+
+### Migrations
+
+`OpenSQL` is the handle [go-rio/migrate](https://github.com/go-rio/migrate)
+consumes:
+
+```go
+sqlDB, err := sqlite.OpenSQL("app.db")
+m, err := migrate.New(sqlDB, migrate.SQLite)
+```
 
 ## Contributing
 

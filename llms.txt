@@ -1,10 +1,10 @@
 # go-rio/sqlite
 
-> SQLite driver module for the rio ORM: pure-Go driver, connection defaults, error translation, statement cache on by default.
+> SQLite driver module for the rio ORM: the pure-Go modernc.org/sqlite library driven directly on rio's native channel, plus a thin database/sql handle for migrations.
 
 ## Overview
 
-`github.com/go-rio/sqlite` connects `github.com/go-rio/rio` to SQLite through modernc.org/sqlite (pure Go, no C toolchain). `Open` appends connection defaults to the DSN (`foreign_keys`, `busy_timeout`, `_time_format=sqlite`, `_timezone=UTC`, `_txlock=immediate`), installs the translator that maps SQLite constraint codes to rio sentinels, and turns on rio's statement cache. rio itself renders the SQL and owns query semantics.
+`github.com/go-rio/sqlite` connects `github.com/go-rio/rio` to SQLite through `modernc.org/sqlite/lib` (pure Go, no C toolchain) without database/sql in the path. `Open` returns a `*rio.DB` on rio's native channel: every connection keeps a prepared-statement cache, rows decode by storage class straight into rio's scan cells, and constraint codes translate to rio sentinels. `OpenSQL` serves a plain `*sql.DB` over the same connection layer for tools such as go-rio/migrate. rio itself renders the SQL and owns query semantics.
 
 ## Quick Start
 
@@ -45,18 +45,25 @@ func main() {
 
 ## Key Concepts
 
-- **DSN defaults, explicit values win**: `Open` adds a default only when the DSN does not set that key.
-- **One writer at a time**: SQLite serializes writes; `_txlock=immediate` makes writers wait on `busy_timeout` instead of failing a lock upgrade. Use WAL for concurrent readers.
-- **`:memory:` is per connection**: share one in-memory database with `file:app?mode=memory&cache=shared` and `SetMaxOpenConns(1)`.
-- **Times as UTC text**: rio writes `2006-01-02 15:04:05.999999+00:00`; `_timezone=UTC` makes driver-bound times match.
-- **Statement cache**: on by default; `rio.WithoutStmtCache()` opts out.
+- **Native channel**: `Open` bypasses database/sql; nothing opens until first use, so invalid paths surface then. `rio.WithStmtCache` is unsupported because each connection caches prepared statements itself.
+- **DSN**: a path, `:memory:`, or a `file:` URI. Module parameters: `_pragma=name(value)` (repeatable), `_txlock` (`immediate` default, `deferred`, `exclusive`), and the shorthands `_busy_timeout`/`_timeout`, `_auto_vacuum`/`_vacuum`, `_foreign_keys`/`_fk`, `_journal_mode`/`_journal`, `_synchronous`/`_sync`, `_query_only`. `busy_timeout(5000)` and `foreign_keys(1)` apply unless set; other underscore parameters are rejected.
+- **Pool**: connections open on demand up to `PoolOf(db).MaxConns()` (`GOMAXPROCS`); `SetMaxConns` changes the cap. Private memory, temporary, and shared-cache databases run on one connection.
+- **Transactions**: `BEGIN` in the `_txlock` mode, deferred when read-only; a failed `COMMIT` rolls back before the connection returns; nested `rio.Tx` calls are savepoints. A canceled context interrupts the running statement.
+- **Values**: `time.Time` binds as `2006-01-02 15:04:05.999999+00:00` at UTC; TEXT in `time.Time` fields or `DATE`/`DATETIME`/`TIMESTAMP` columns parses SQLite's date-time forms to UTC.
+- **`Unwrap`**: a database/sql view with connections of its own; nil for private memory and temporary databases.
 
 ## API Reference
 
 ### Core Functions
 
-- `Open(dsn string, opts ...rio.Option) (*rio.DB, error)` - append defaults, open lazily, install the translator and the statement cache.
-- `New(db *sql.DB, opts ...rio.Option) *rio.DB` - wrap an existing pool with the SQLite dialect, translator, and statement cache; no DSN changes.
+- `Open(dsn string, opts ...rio.Option) (*rio.DB, error)` - parse the DSN and return a native-channel handle; fails only on a malformed DSN.
+- `OpenSQL(dsn string) (*sql.DB, error)` - a plain database/sql handle over the same connection layer, one SQLite connection per database/sql connection; the handle go-rio/migrate consumes.
+- `PoolOf(db *rio.DB) *Pool` - the native pool behind an `Open` handle, nil for other constructions.
+
+### Types
+
+- `Pool` - `MaxConns() int`, `SetMaxConns(n int)`, `Close() error`.
+- `Error` - every SQLite failure; `Code() int` is the extended result code, `Error()` the message with the code appended.
 
 ## Common Patterns
 
@@ -64,20 +71,28 @@ func main() {
 
 ```go
 db, _ := sqlite.Open("file:app?mode=memory&cache=shared")
-db.Unwrap().SetMaxOpenConns(1)
 ```
 
 ### Concurrent readers and writers
 
 ```go
-db, err := sqlite.Open("app.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)")
+db, err := sqlite.Open("app.db?_journal_mode=WAL&_busy_timeout=10000")
+sqlite.PoolOf(db).SetMaxConns(8)
+```
+
+### Migrations
+
+```go
+sqlDB, err := sqlite.OpenSQL("app.db")
+m, err := migrate.New(sqlDB, migrate.SQLite)
 ```
 
 ## Error Handling
 
 - `rio.ErrDuplicateKey` - `SQLITE_CONSTRAINT_UNIQUE`, `SQLITE_CONSTRAINT_PRIMARYKEY`, `SQLITE_CONSTRAINT_ROWID`; the `*sqlite.Error` stays in the chain for `errors.As`.
 - `rio.ErrForeignKeyViolated` - `SQLITE_CONSTRAINT_FOREIGNKEY` (requires the `foreign_keys` default).
-- Invalid paths and DSNs surface on first use or `Ping`, not from `Open`.
+- `context.Canceled` / `context.DeadlineExceeded` - the statement was interrupted by its context.
+- Invalid paths surface on first use or `Ping`, not from `Open`.
 
 ## References
 

@@ -6,6 +6,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-02
+
+### Added
+
+- `Open` serves rio's native channel: statements run directly against the embedded SQLite library (`modernc.org/sqlite/lib`), every connection keeps a bounded prepared-statement cache, and rows decode by storage class straight into rio's scan cells. Against database/sql with the statement cache, reading 100 rows is about 3× faster and a point read about 2.4×, with an order of magnitude fewer allocations.
+- `OpenSQL` returns a plain `*sql.DB` over the same connection layer, the handle go-rio/migrate consumes; `db.Unwrap()` serves the same kind of view wherever a second connection can reach the database.
+- `Pool` and `PoolOf`: the connection cap (`MaxConns`, `SetMaxConns`), `GOMAXPROCS` by default and one connection for private memory, temporary, and shared-cache databases.
+- `Error` carries the extended result code (`Code`) and message of every SQLite failure.
+- DSN shorthands `_busy_timeout`/`_timeout`, `_auto_vacuum`/`_vacuum`, `_foreign_keys`/`_fk`, `_journal_mode`/`_journal`, `_synchronous`/`_sync`, and `_query_only`, applied in the modernc driver's order; a shorthand also satisfies a default.
+- A canceled context interrupts the running statement and surfaces the context's error.
+
+### Changed
+
+- Times decode at UTC from every SQLite text form (date, `T` or space separator, fraction, `Z` or offset), both into `time.Time` fields and from `DATE`, `DATETIME`, and `TIMESTAMP` columns.
+- Read-only transactions begin deferred; every isolation level is accepted, SQLite being serializable. A failed `COMMIT` rolls the connection back before it returns to the pool.
+- rio v0.17.0, whose `NativeLastInserter` backfills a lone auto-increment key from `sqlite3_last_insert_rowid`.
+
+### Removed
+
+- `New` and the database/sql channel over the modernc driver. `rio.WithStmtCache` now panics in `rio.NewNative`; the per-connection cache replaces it.
+- The `_time_format` and `_timezone` parameters: values bind and decode at UTC. Unknown underscore parameters are rejected.
+
 ## [0.5.1] - 2026-09-02
 
 ### Added
@@ -92,7 +114,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Initial release: `Open` and `New`, `foreign_keys` and `busy_timeout` defaults, duplicate-key and foreign-key error translation.
 
-[Unreleased]: https://github.com/go-rio/sqlite/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/go-rio/sqlite/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/go-rio/sqlite/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/go-rio/sqlite/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/go-rio/sqlite/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/go-rio/sqlite/compare/v0.4.0...v0.4.1

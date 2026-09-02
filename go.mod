@@ -3,7 +3,8 @@ module github.com/go-rio/sqlite
 go 1.27.0
 
 require (
-	github.com/go-rio/rio v0.16.0
+	github.com/go-rio/rio v0.17.0
+	modernc.org/libc v1.75.3
 	modernc.org/sqlite v1.57.0
 )
 
@@ -14,7 +15,6 @@ require (
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	golang.org/x/sys v0.47.0 // indirect
-	modernc.org/libc v1.75.3 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.12.0 // indirect
 )

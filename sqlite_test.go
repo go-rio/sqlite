@@ -2,17 +2,17 @@ package sqlite
 
 import (
 	"context"
-	"database/sql"
 	"errors"
-	"fmt"
-	"os"
+	"iter"
 	"path/filepath"
+	"runtime"
+	"slices"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/go-rio/rio"
-	driver "modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
 )
 
@@ -40,14 +40,12 @@ CREATE TABLE posts (
 	title   TEXT NOT NULL
 );`
 
-// One connection: each connection gets its own in-memory database.
-func openTestDB(t *testing.T, dsn string) *rio.DB {
+func openTestDB(t *testing.T, dsn string, opts ...rio.Option) *rio.DB {
 	t.Helper()
-	db, err := Open(dsn)
+	db, err := Open(dsn, opts...)
 	if err != nil {
 		t.Fatalf("Open(%q): %v", dsn, err)
 	}
-	db.Unwrap().SetMaxOpenConns(1)
 	t.Cleanup(func() {
 		if err := db.Close(); err != nil {
 			t.Errorf("Close: %v", err)
@@ -56,28 +54,16 @@ func openTestDB(t *testing.T, dsn string) *rio.DB {
 	return db
 }
 
-// wrapTestDB opens dsn without Open's DSN defaults and wraps it with New.
-func wrapTestDB(t *testing.T, dsn string, opts ...rio.Option) *rio.DB {
+func mustExec(t *testing.T, db *rio.DB, stmt string, args ...any) {
 	t.Helper()
-	sqlDB, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		t.Fatalf("sql.Open(%q): %v", dsn, err)
+	if _, err := rio.Exec(context.Background(), db, stmt, args...); err != nil {
+		t.Fatalf("exec %q: %v", stmt, err)
 	}
-	sqlDB.SetMaxOpenConns(1)
-	db := New(sqlDB, opts...)
-	t.Cleanup(func() {
-		if err := db.Close(); err != nil {
-			t.Errorf("Close: %v", err)
-		}
-	})
-	return db
 }
 
-func mustExec(t *testing.T, db *rio.DB, ddl string) {
+func tempDSN(t *testing.T, query string) string {
 	t.Helper()
-	if _, err := db.Unwrap().Exec(ddl); err != nil {
-		t.Fatalf("exec schema: %v", err)
-	}
+	return "file:" + filepath.Join(t.TempDir(), "test.db") + query
 }
 
 func TestOpenEndToEnd(t *testing.T) {
@@ -92,7 +78,6 @@ func TestOpenEndToEnd(t *testing.T) {
 	if alice.ID == 0 {
 		t.Fatal("Insert did not backfill the primary key")
 	}
-
 	got, err := rio.Find[user](ctx, db, alice.ID)
 	if err != nil {
 		t.Fatalf("Find: %v", err)
@@ -100,7 +85,10 @@ func TestOpenEndToEnd(t *testing.T) {
 	if *got != alice {
 		t.Fatalf("Find returned %+v, want %+v", *got, alice)
 	}
-
+	alice.Name = "Alice B"
+	if err := rio.Update(ctx, db, &alice); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
 	first, err := rio.From[user]().Where("email = ?", alice.Email).First(ctx, db)
 	if err != nil {
 		t.Fatalf("First: %v", err)
@@ -108,327 +96,218 @@ func TestOpenEndToEnd(t *testing.T) {
 	if *first != alice {
 		t.Fatalf("First returned %+v, want %+v", *first, alice)
 	}
-}
-
-func TestDuplicateKeyTranslation(t *testing.T) {
-	ctx := context.Background()
-	db := openTestDB(t, ":memory:")
-	mustExec(t, db, testSchema)
-
-	alice := user{Email: "alice@example.com", Name: "Alice"}
-	if err := rio.Insert(ctx, db, &alice); err != nil {
-		t.Fatalf("Insert: %v", err)
+	if err := rio.Delete(ctx, db, &alice); err != nil {
+		t.Fatalf("Delete: %v", err)
 	}
-
-	dup := user{Email: "alice@example.com", Name: "Alice again"}
-	err := rio.Insert(ctx, db, &dup)
-	if !errors.Is(err, rio.ErrDuplicateKey) {
-		t.Fatalf("duplicate email: got %v, want rio.ErrDuplicateKey", err)
-	}
-
-	var de *driver.Error
-	if !errors.As(err, &de) {
-		t.Fatalf("duplicate email: driver error missing from chain: %v", err)
-	}
-	if de.Code() != sqlite3.SQLITE_CONSTRAINT_UNIQUE {
-		t.Fatalf("duplicate email: driver code = %d, want %d", de.Code(), sqlite3.SQLITE_CONSTRAINT_UNIQUE)
-	}
-
-	pkDup := user{ID: alice.ID, Email: "other@example.com", Name: "Other"}
-	if err := rio.Insert(ctx, db, &pkDup); !errors.Is(err, rio.ErrDuplicateKey) {
-		t.Fatalf("duplicate primary key: got %v, want rio.ErrDuplicateKey", err)
-	}
-
-	// Without an INTEGER PRIMARY KEY alias, a duplicate rowid is its own code.
-	mustExec(t, db, "CREATE TABLE notes (body TEXT NOT NULL)")
-	const note = "INSERT INTO notes (rowid, body) VALUES (1, 'note')"
-	if _, err := rio.Exec(ctx, db, note); err != nil {
-		t.Fatalf("Exec: %v", err)
-	}
-	_, err = rio.Exec(ctx, db, note)
-	if !errors.Is(err, rio.ErrDuplicateKey) {
-		t.Fatalf("duplicate rowid: got %v, want rio.ErrDuplicateKey", err)
-	}
-	if !errors.As(err, &de) {
-		t.Fatalf("duplicate rowid: driver error missing from chain: %v", err)
-	}
-	if de.Code() != sqlite3.SQLITE_CONSTRAINT_ROWID {
-		t.Fatalf("duplicate rowid: driver code = %d, want %d", de.Code(), sqlite3.SQLITE_CONSTRAINT_ROWID)
+	n, err := rio.From[user]().Count(ctx, db)
+	if err != nil || n != 0 {
+		t.Fatalf("Count after Delete = %d, %v; want 0", n, err)
 	}
 }
 
-func TestForeignKeysEnforced(t *testing.T) {
-	ctx := context.Background()
-	db := openTestDB(t, ":memory:")
-	mustExec(t, db, testSchema)
-
-	orphan := post{UserID: 9001, Title: "orphan"}
-	if err := rio.Insert(ctx, db, &orphan); !errors.Is(err, rio.ErrForeignKeyViolated) {
-		t.Fatalf("orphan insert: got %v, want rio.ErrForeignKeyViolated", err)
-	}
-
-	owner := user{Email: "owner@example.com", Name: "Owner"}
-	if err := rio.Insert(ctx, db, &owner); err != nil {
-		t.Fatalf("Insert owner: %v", err)
-	}
-	ok := post{UserID: owner.ID, Title: "hello"}
-	if err := rio.Insert(ctx, db, &ok); err != nil {
-		t.Fatalf("Insert post: %v", err)
-	}
-}
-
-func TestConcurrentWrites(t *testing.T) {
-	ctx := context.Background()
-
-	// Use a file-backed database so writers contend over shared state.
-	db, err := Open(filepath.Join(t.TempDir(), "concurrent.db") +
-		"?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)")
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := db.Close(); err != nil {
-			t.Errorf("Close: %v", err)
+func TestOpenRejects(t *testing.T) {
+	for _, dsn := range []string{"x.db?_timezone=UTC", "x.db?_txlock=bogus", "x.db?%zz"} {
+		if _, err := Open(dsn); err == nil {
+			t.Errorf("Open(%q) should fail", dsn)
 		}
-	})
-	mustExec(t, db, testSchema)
+		if _, err := OpenSQL(dsn); err == nil {
+			t.Errorf("OpenSQL(%q) should fail", dsn)
+		}
+	}
+	defer func() {
+		if recover() == nil {
+			t.Fatal("rio.WithStmtCache should panic on the native channel")
+		}
+	}()
+	_, _ = Open(":memory:", rio.WithStmtCache())
+}
 
-	const writers, rows = 2, 50
-	errs := make(chan error, writers)
+func TestParseDSN(t *testing.T) {
+	defaults := []string{"PRAGMA busy_timeout(5000)", "PRAGMA foreign_keys(1)"}
+	cases := []struct {
+		dsn             string
+		name, vfs       string
+		begin           string
+		pragmas         []string
+		single, private bool
+	}{
+		{dsn: "", begin: "BEGIN IMMEDIATE", pragmas: defaults, single: true, private: true},
+		{dsn: ":memory:", name: ":memory:", begin: "BEGIN IMMEDIATE", pragmas: defaults, single: true, private: true},
+		{dsn: "app.db", name: "app.db", begin: "BEGIN IMMEDIATE", pragmas: defaults},
+		{
+			dsn:  "/tmp/x.db?_journal_mode=WAL&_busy_timeout=100&_txlock=deferred&vfs=unix-none",
+			name: "/tmp/x.db", vfs: "unix-none", begin: "BEGIN",
+			pragmas: []string{"PRAGMA foreign_keys(1)", "PRAGMA busy_timeout = 100", "PRAGMA journal_mode = WAL"},
+		},
+		{
+			dsn:     "file:x?mode=memory&cache=shared&_fk=0&_pragma=synchronous(OFF)&_txlock=exclusive",
+			name:    "file:x?mode=memory&cache=shared&_fk=0&_pragma=synchronous(OFF)&_txlock=exclusive",
+			begin:   "BEGIN EXCLUSIVE",
+			pragmas: []string{"PRAGMA busy_timeout(5000)", "PRAGMA synchronous(OFF)", "PRAGMA foreign_keys = 0"},
+			single:  true,
+		},
+		{dsn: "file:app.db?immutable=1", name: "file:app.db?immutable=1", begin: "BEGIN IMMEDIATE", pragmas: defaults},
+	}
+	for _, tc := range cases {
+		cfg, err := parseDSN(tc.dsn)
+		if err != nil {
+			t.Fatalf("parseDSN(%q): %v", tc.dsn, err)
+		}
+		same := cfg.conn.name == tc.name && cfg.conn.vfs == tc.vfs && cfg.begin == tc.begin &&
+			slices.Equal(cfg.conn.pragmas, tc.pragmas) && cfg.single == tc.single && cfg.private == tc.private
+		if !same {
+			t.Errorf("parseDSN(%q) = %+v", tc.dsn, cfg)
+		}
+	}
+}
+
+func TestPoolShape(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		dsn          string
+		single, view bool
+	}{
+		{":memory:", true, false},
+		{"", true, false},
+		{"file:shape?mode=memory&cache=shared", true, true},
+		{tempDSN(t, ""), false, true},
+	} {
+		db := openTestDB(t, tc.dsn)
+		want := runtime.GOMAXPROCS(0)
+		if tc.single {
+			want = 1
+		}
+		if got := PoolOf(db).MaxConns(); got != want {
+			t.Errorf("%q: MaxConns = %d, want %d", tc.dsn, got, want)
+		}
+		if (db.Unwrap() != nil) != tc.view {
+			t.Errorf("%q: Unwrap non-nil = %v, want %v", tc.dsn, db.Unwrap() != nil, tc.view)
+		}
+		mustExec(t, db, "CREATE TABLE seen (x INTEGER)")
+		if n, err := rio.From[user]().Count(ctx, db); err == nil || n != 0 {
+			t.Errorf("%q: counting a missing table should fail", tc.dsn)
+		}
+		if !tc.view {
+			continue
+		}
+		var n int
+		if err := db.Unwrap().QueryRow("SELECT count(*) FROM sqlite_master WHERE name = 'seen'").Scan(&n); err != nil || n != 1 {
+			t.Errorf("%q: the view does not see the native table: %d, %v", tc.dsn, n, err)
+		}
+	}
+	sqlDB, err := OpenSQL(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if PoolOf(rio.New(sqlDB, rio.SQLite)) != nil {
+		t.Fatal("PoolOf should be nil on the database/sql channel")
+	}
+}
+
+func TestPoolWaitsForConnections(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t, tempDSN(t, ""))
+	PoolOf(db).SetMaxConns(1)
+	mustExec(t, db, testSchema)
+	for _, name := range []string{"a", "b"} {
+		mustExec(t, db, "INSERT INTO users (email, name) VALUES (?, ?)", name+"@example.com", name)
+	}
+	next, stop := iter.Pull2(rio.From[user]().OrderBy("id").Rows(ctx, db))
+	if _, err, ok := next(); !ok || err != nil {
+		t.Fatalf("first row: %v, %v", err, ok)
+	}
+	short, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	if _, err := rio.From[user]().Count(short, db); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Count on a busy pool = %v, want DeadlineExceeded", err)
+	}
+	done := make(chan int64, 1)
+	go func() {
+		n, _ := rio.From[user]().Count(ctx, db)
+		done <- n
+	}()
+	time.Sleep(20 * time.Millisecond)
+	stop()
+	if n := <-done; n != 2 {
+		t.Fatalf("Count after release = %d, want 2", n)
+	}
+}
+
+func TestTxLock(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		query string
+		busy  bool
+	}{
+		{"?_pragma=busy_timeout(50)", true},
+		{"?_pragma=busy_timeout(50)&_txlock=deferred", false},
+	} {
+		db := openTestDB(t, tempDSN(t, tc.query))
+		PoolOf(db).SetMaxConns(2)
+		mustExec(t, db, testSchema)
+		err := db.Tx(ctx, func(tx *rio.Tx) error {
+			return db.Tx(ctx, func(*rio.Tx) error { return nil })
+		})
+		var se *Error
+		gotBusy := errors.As(err, &se) && se.Code() == sqlite3.SQLITE_BUSY
+		if gotBusy != tc.busy {
+			t.Fatalf("%s: second transaction error = %v, want busy %v", tc.query, err, tc.busy)
+		}
+	}
+}
+
+func TestErrorTranslation(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t, ":memory:")
+	mustExec(t, db, testSchema)
+	if err := rio.Insert(ctx, db, &user{Email: "dup@example.com", Name: "One"}); err != nil {
+		t.Fatal(err)
+	}
+	err := rio.Insert(ctx, db, &user{Email: "dup@example.com", Name: "Two"})
+	var se *Error
+	if !errors.Is(err, rio.ErrDuplicateKey) || !errors.As(err, &se) || se.Code() != sqlite3.SQLITE_CONSTRAINT_UNIQUE {
+		t.Fatalf("duplicate insert error = %v", err)
+	}
+	if err := rio.Insert(ctx, db, &post{UserID: 999, Title: "orphan"}); !errors.Is(err, rio.ErrForeignKeyViolated) {
+		t.Fatalf("orphan insert error = %v", err)
+	}
+	db = openTestDB(t, "file:nofk?mode=memory&_fk=0")
+	mustExec(t, db, testSchema)
+	if err := rio.Insert(ctx, db, &post{UserID: 999, Title: "orphan"}); err != nil {
+		t.Fatalf("_fk=0 should disable enforcement: %v", err)
+	}
+}
+
+func TestConcurrentAccess(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t, tempDSN(t, "?_journal_mode=WAL"))
+	PoolOf(db).SetMaxConns(4)
+	mustExec(t, db, testSchema)
 	var wg sync.WaitGroup
-	for w := range writers {
-		wg.Go(func() {
-			for i := range rows {
-				u := user{Email: fmt.Sprintf("w%d-%d@example.com", w, i), Name: "writer"}
+	errs := make(chan error, 64)
+	for g := range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range 25 {
+				u := user{Email: strconv.Itoa(g*100+i) + "@example.com", Name: "n"}
 				if err := rio.Insert(ctx, db, &u); err != nil {
-					errs <- fmt.Errorf("writer %d row %d: %w", w, i, err)
+					errs <- err
+					return
+				}
+				if _, err := rio.From[user]().Where("id = ?", u.ID).First(ctx, db); err != nil {
+					errs <- err
 					return
 				}
 			}
-		})
+		}()
 	}
 	wg.Wait()
 	close(errs)
 	for err := range errs {
-		t.Error(err)
+		t.Fatal(err)
 	}
-
-	n, err := rio.From[user]().Count(ctx, db)
-	if err != nil {
-		t.Fatalf("Count: %v", err)
-	}
-	if n != writers*rows {
-		t.Fatalf("Count = %d, want %d", n, writers*rows)
-	}
-}
-
-func TestOpenEmptyDSN(t *testing.T) {
-	// A fresh directory exposes regressions that turn the empty DSN into a file.
-	t.Chdir(t.TempDir())
-	ctx := context.Background()
-
-	db, err := Open("")
-	if err != nil {
-		t.Fatalf(`Open(""): %v`, err)
-	}
-	db.Unwrap().SetMaxOpenConns(1)
-	mustExec(t, db, testSchema)
-
-	for pragma, want := range map[string]int64{"foreign_keys": 1, "busy_timeout": 5000} {
-		var got int64
-		if err := db.Unwrap().QueryRow("PRAGMA " + pragma).Scan(&got); err != nil {
-			t.Fatalf("PRAGMA %s: %v", pragma, err)
-		}
-		if got != want {
-			t.Errorf("PRAGMA %s = %d, want %d", pragma, got, want)
-		}
-	}
-
-	orphan := post{UserID: 9001, Title: "orphan"}
-	if err := rio.Insert(ctx, db, &orphan); !errors.Is(err, rio.ErrForeignKeyViolated) {
-		t.Fatalf("orphan insert: got %v, want rio.ErrForeignKeyViolated", err)
-	}
-	owner := user{Email: "owner@example.com", Name: "Owner"}
-	if err := rio.Insert(ctx, db, &owner); err != nil {
-		t.Fatalf("Insert: %v", err)
-	}
-
-	if err := db.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-	entries, err := os.ReadDir(".")
-	if err != nil {
-		t.Fatalf("ReadDir: %v", err)
-	}
-	for _, e := range entries {
-		t.Errorf(`Open("") left %q in the working directory`, e.Name())
-	}
-}
-
-func TestNewInstallsTranslator(t *testing.T) {
-	ctx := context.Background()
-
-	// New does not configure an existing pool, so enable foreign keys here.
-	db := wrapTestDB(t, ":memory:?_pragma=foreign_keys(1)")
-	mustExec(t, db, testSchema)
-
-	alice := user{Email: "alice@example.com", Name: "Alice"}
-	if err := rio.Insert(ctx, db, &alice); err != nil {
-		t.Fatalf("Insert: %v", err)
-	}
-	dup := user{Email: "alice@example.com", Name: "Alice again"}
-	if err := rio.Insert(ctx, db, &dup); !errors.Is(err, rio.ErrDuplicateKey) {
-		t.Fatalf("duplicate email: got %v, want rio.ErrDuplicateKey", err)
-	}
-	orphan := post{UserID: 9001, Title: "orphan"}
-	if err := rio.Insert(ctx, db, &orphan); !errors.Is(err, rio.ErrForeignKeyViolated) {
-		t.Fatalf("orphan insert: got %v, want rio.ErrForeignKeyViolated", err)
-	}
-}
-
-func TestNewWithoutStmtCache(t *testing.T) {
-	ctx := context.Background()
-	db := wrapTestDB(t, ":memory:", rio.WithoutStmtCache())
-	mustExec(t, db, testSchema)
-
-	alice := user{Email: "alice@example.com", Name: "Alice"}
-	if err := rio.Insert(ctx, db, &alice); err != nil {
-		t.Fatalf("Insert: %v", err)
-	}
-	got, err := rio.Find[user](ctx, db, alice.ID)
-	if err != nil {
-		t.Fatalf("Find: %v", err)
-	}
-	if *got != alice {
-		t.Fatalf("Find returned %+v, want %+v", *got, alice)
-	}
-}
-
-func TestOpenPragmaDefaultsAndOverrides(t *testing.T) {
-	tests := []struct {
-		name   string
-		dsn    string
-		pragma string
-		want   int64
-	}{
-		{"default foreign_keys on", ":memory:", "foreign_keys", 1},
-		{"default busy_timeout 5000", ":memory:", "busy_timeout", 5000},
-		{"user foreign_keys wins", ":memory:?_pragma=foreign_keys(0)", "foreign_keys", 0},
-		{"user busy_timeout wins", ":memory:?_pragma=busy_timeout(1234)", "busy_timeout", 1234},
-		{"other default still applied", ":memory:?_pragma=foreign_keys(0)", "busy_timeout", 5000},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			db := openTestDB(t, tt.dsn)
-			var got int64
-			if err := db.Unwrap().QueryRow("PRAGMA " + tt.pragma).Scan(&got); err != nil {
-				t.Fatalf("PRAGMA %s: %v", tt.pragma, err)
-			}
-			if got != tt.want {
-				t.Fatalf("PRAGMA %s = %d, want %d", tt.pragma, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestOpenBindsTimesInUTC(t *testing.T) {
-	at := time.Date(2024, 1, 2, 3, 4, 5, 0, time.FixedZone("UTC+8", 8*3600))
-	const layout = "2006-01-02 15:04:05.999999999-07:00"
-	tests := []struct {
-		name string
-		dsn  string
-		want string
-	}{
-		{"default UTC", ":memory:", "2024-01-01 19:04:05+00:00"},
-		{"user timezone wins", ":memory:?_timezone=Local", at.In(time.Local).Format(layout)},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			db := openTestDB(t, tt.dsn)
-			mustExec(t, db, "CREATE TABLE stamps (at TEXT NOT NULL)")
-			if _, err := db.Unwrap().Exec("INSERT INTO stamps (at) VALUES (?)", at); err != nil {
-				t.Fatalf("Exec: %v", err)
-			}
-			var got string
-			if err := db.Unwrap().QueryRow("SELECT at FROM stamps").Scan(&got); err != nil {
-				t.Fatalf("Scan: %v", err)
-			}
-			if got != tt.want {
-				t.Fatalf("stored %q, want %q", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestOpenBeginsImmediate(t *testing.T) {
-	tests := []struct {
-		name     string
-		params   string
-		wantBusy bool
-	}{
-		{"default immediate", "", true},
-		{"user txlock wins", "&_txlock=deferred", false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			ctx := context.Background()
-			// A zero busy timeout fails a contended BEGIN instead of waiting.
-			db, err := Open(filepath.Join(t.TempDir(), "lock.db") + "?_pragma=busy_timeout(0)" + tt.params)
-			if err != nil {
-				t.Fatalf("Open: %v", err)
-			}
-			t.Cleanup(func() {
-				if err := db.Close(); err != nil {
-					t.Errorf("Close: %v", err)
-				}
-			})
-
-			holder, err := db.Unwrap().BeginTx(ctx, nil)
-			if err != nil {
-				t.Fatalf("first BeginTx: %v", err)
-			}
-			t.Cleanup(func() { _ = holder.Rollback() })
-			contender, err := db.Unwrap().BeginTx(ctx, nil)
-			if err == nil {
-				t.Cleanup(func() { _ = contender.Rollback() })
-			}
-			var de *driver.Error
-			gotBusy := errors.As(err, &de) && de.Code() == sqlite3.SQLITE_BUSY
-			if gotBusy != tt.wantBusy {
-				t.Fatalf("second BeginTx: err = %v, want busy = %t", err, tt.wantBusy)
-			}
-		})
-	}
-}
-
-const params = "&_time_format=sqlite&_timezone=UTC&_txlock=immediate"
-
-func TestWithDefaultPragmas(t *testing.T) {
-	tests := []struct {
-		dsn  string
-		want string
-	}{
-		{"", "file:?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)" + params},
-		{":memory:", ":memory:?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)" + params},
-		{"app.db", "app.db?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)" + params},
-		{"file:app.db?mode=ro", "file:app.db?mode=ro&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)" + params},
-		{"app.db?", "app.db?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)" + params},
-		{"app.db?_pragma=foreign_keys(0)", "app.db?_pragma=foreign_keys(0)&_pragma=busy_timeout(5000)" + params},
-		{"app.db?_pragma=busy_timeout(1)&_pragma=foreign_keys(1)", "app.db?_pragma=busy_timeout(1)&_pragma=foreign_keys(1)" + params},
-		{"app.db?_pragma=busy_timeout%285000%29", "app.db?_pragma=busy_timeout%285000%29&_pragma=foreign_keys(1)" + params},
-		{"app.db?_pragma=foreign_keys+%3D+ON", "app.db?_pragma=foreign_keys+%3D+ON&_pragma=busy_timeout(5000)" + params},
-		{"app.db?_time_format=sqlite",
-			"app.db?_time_format=sqlite&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_timezone=UTC&_txlock=immediate"},
-		{"app.db?_timezone=Local",
-			"app.db?_timezone=Local&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_time_format=sqlite&_txlock=immediate"},
-		{"app.db?_txlock=deferred",
-			"app.db?_txlock=deferred&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_time_format=sqlite&_timezone=UTC"},
-		{"?weird", "?weird"},
-		{"app.db?_pragma=%zz", "app.db?_pragma=%zz"},
-	}
-	for _, tt := range tests {
-		if got := withDefaultPragmas(tt.dsn); got != tt.want {
-			t.Errorf("withDefaultPragmas(%q) = %q, want %q", tt.dsn, got, tt.want)
-		}
+	if n, _ := rio.From[user]().Count(ctx, db); n != 200 {
+		t.Fatalf("Count = %d, want 200", n)
 	}
 }
