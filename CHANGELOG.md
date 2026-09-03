@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-09-02
+
+### Changed
+
+- rio v0.18.1.
+
 ## [0.6.1] - 2026-09-02
 
 ### Changed
@@ -120,7 +126,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Initial release: `Open` and `New`, `foreign_keys` and `busy_timeout` defaults, duplicate-key and foreign-key error translation.
 
-[Unreleased]: https://github.com/go-rio/sqlite/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/go-rio/sqlite/compare/v0.6.2...HEAD
+[0.6.2]: https://github.com/go-rio/sqlite/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/go-rio/sqlite/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/go-rio/sqlite/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/go-rio/sqlite/compare/v0.5.0...v0.5.1
