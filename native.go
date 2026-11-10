@@ -128,7 +128,7 @@ type nativeRows struct {
 	s      *stmt // nil: no statement, an empty result
 	p      *Pool // nil for transaction rows
 	ctx    context.Context
-	stop   func() bool
+	w      *watcher
 	err    error
 	done   bool
 	sinks  []sink
@@ -136,13 +136,13 @@ type nativeRows struct {
 }
 
 func newRows(ctx context.Context, c *conn, p *Pool, sqlText string, args []any) (*nativeRows, error) {
-	stop := c.watch(ctx)
+	w := c.watch(ctx)
 	s, err := c.query(ctx, sqlText, args)
 	if err != nil {
-		c.unwatch(stop)
+		c.unwatch(w)
 		return nil, err
 	}
-	return &nativeRows{c: c, s: s, p: p, ctx: ctx, stop: stop}, nil
+	return &nativeRows{c: c, s: s, p: p, ctx: ctx, w: w}, nil
 }
 
 func (r *nativeRows) Columns() []string {
@@ -176,7 +176,7 @@ func (r *nativeRows) Close() {
 	if r.s != nil {
 		r.c.done(r.s)
 	}
-	r.c.unwatch(r.stop)
+	r.c.unwatch(r.w)
 	if r.p != nil {
 		r.p.release(r.c)
 	}

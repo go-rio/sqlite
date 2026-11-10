@@ -4,9 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"runtime"
 	"strconv"
 	"testing"
 	"time"
+
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 func openTestConn(t *testing.T) *conn {
@@ -146,6 +149,23 @@ func TestConnInterrupt(t *testing.T) {
 	}
 	if _, _, err := c.exec(context.Background(), "SELECT * FROM missing", nil); err == nil {
 		t.Fatal("expected an error for a missing table")
+	}
+}
+
+func TestConnNestedWatch(t *testing.T) {
+	c := openTestConn(t)
+	outer := c.watch(t.Context())
+	ctx, cancel := context.WithCancel(t.Context())
+	inner := c.watch(ctx)
+	cancel()
+	for sqlite3.Xsqlite3_is_interrupted(c.tls, c.db) == 0 {
+		runtime.Gosched()
+	}
+	// The inner unwatch must not wait on the still-armed outer watcher.
+	c.unwatch(inner)
+	c.unwatch(outer)
+	if len(c.idle) != 2 {
+		t.Fatalf("idle watchers = %d, want 2", len(c.idle))
 	}
 }
 

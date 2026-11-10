@@ -54,12 +54,11 @@ type connConfig struct {
 type conn struct {
 	tls   *libc.TLS
 	db    uintptr
-	out   [2]uintptr // sqlite3_prepare_v2 out-parameters: statement, tail
+	out   *[2]uintptr // C memory for the open_v2 and prepare_v2 out-parameters
 	stmts map[string]*stmt
 	// LRU order, head most recently used.
 	head, tail *stmt
-	// intMu lets unwatch wait for an interrupt already running.
-	intMu sync.Mutex
+	idle       []*watcher // watchers free for reuse
 }
 
 func openConn(cfg *connConfig) (*conn, error) {
@@ -78,6 +77,8 @@ func openConn(cfg *connConfig) (*conn, error) {
 		}
 		defer libc.Xfree(c.tls, vfs)
 	}
+	// The library rejects out-parameters in Go memory under checkptr.
+	c.out = (*[2]uintptr)(unsafe.Pointer(&libc.GoBytes(libc.Xmalloc(c.tls, 16), 16)[0]))
 	rc := sqlite3.Xsqlite3_open_v2(c.tls, name, uintptr(unsafe.Pointer(&c.out[0])), openFlags, vfs)
 	c.db = c.out[0]
 	if rc != sqlite3.SQLITE_OK {
@@ -104,6 +105,7 @@ func (c *conn) close() {
 		sqlite3.Xsqlite3_close_v2(c.tls, c.db)
 		c.db = 0
 	}
+	libc.Xfree(c.tls, uintptr(unsafe.Pointer(c.out)))
 	c.tls.Close()
 }
 
@@ -111,8 +113,8 @@ func (c *conn) close() {
 // in order, and reports the change count and last inserted row id after
 // the final one.
 func (c *conn) exec(ctx context.Context, sql string, args []any) (changes, lastID int64, err error) {
-	stop := c.watch(ctx)
-	defer c.unwatch(stop)
+	w := c.watch(ctx)
+	defer c.unwatch(w)
 	total := len(args)
 	s, rest, err := c.prepare(sql)
 	for s != nil && err == nil {
@@ -352,28 +354,35 @@ func (c *conn) err() error {
 }
 
 // watch arranges for ctx's cancellation to interrupt the connection; the
-// returned stop goes to unwatch once the statement is done.
-func (c *conn) watch(ctx context.Context) func() bool {
+// returned watcher goes to unwatch once the statement is done.
+func (c *conn) watch(ctx context.Context) *watcher {
 	if ctx.Done() == nil {
 		return nil
 	}
-	return context.AfterFunc(ctx, c.interrupt)
+	var w *watcher
+	if n := len(c.idle); n > 0 {
+		w, c.idle = c.idle[n-1], c.idle[:n-1]
+	} else {
+		w = &watcher{c: c}
+		w.fire = w.interrupt
+	}
+	w.armed.Add(1)
+	w.stop = context.AfterFunc(ctx, w.fire)
+	return w
 }
 
 // unwatch cancels a pending interrupt or waits for a running one, so no
 // interrupt lands on a later statement.
-func (c *conn) unwatch(stop func() bool) {
-	if stop == nil || stop() {
+func (c *conn) unwatch(w *watcher) {
+	if w == nil {
 		return
 	}
-	c.intMu.Lock()
-	c.intMu.Unlock()
-}
-
-func (c *conn) interrupt() {
-	c.intMu.Lock()
-	sqlite3.Xsqlite3_interrupt(c.tls, c.db)
-	c.intMu.Unlock()
+	if w.stop() {
+		w.armed.Done()
+	} else {
+		w.armed.Wait()
+	}
+	c.idle = append(c.idle, w)
 }
 
 // touch moves s to the front of the LRU order.
@@ -442,4 +451,18 @@ type stmt struct {
 	cached     bool
 	inUse      bool
 	prev, next *stmt
+}
+
+// watcher interrupts its connection when a statement's context ends; each
+// open statement has its own, so nested statements wait only on their own.
+type watcher struct {
+	c     *conn
+	fire  func() // interrupt, bound once
+	stop  func() bool
+	armed sync.WaitGroup // from watch until the interrupt has run or stopped
+}
+
+func (w *watcher) interrupt() {
+	sqlite3.Xsqlite3_interrupt(w.c.tls, w.c.db)
+	w.armed.Done()
 }

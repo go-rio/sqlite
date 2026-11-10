@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-10
+
+### Added
+
+- Importing the module turns on two process-wide modernc.org/sqlite settings where the platform has them. Database files take Linux OFD locks, which survive a close of another descriptor of the same file anywhere in the process; POSIX locks silently dropped, leaving the database open to concurrent writers in other processes. Commits sync with `fdatasync(2)` instead of `fsync(2)` on Linux, FreeBSD, NetBSD, and illumos, with the same durability. A set `MODERNC_SQLITE_OFD_LOCK` decides the lock kind instead; modernc.org/sqlite's `OFDLocking(false)`, before the first connection, and `Fdatasync(false)` opt out.
+
+### Changed
+
+- modernc.org/sqlite v1.62.0 (SQLite 3.54.1) and modernc.org/libc v1.80.1; modules that require libc themselves must pin the same version. Native channel on an Apple M4: point read 4.65µs → 0.86µs, single insert 2.25µs → 2.00µs, update 1.47µs → 1.34µs, 100-row batch insert 105µs → 86µs.
+- A statement under a cancellable context allocates once less.
+
+### Security
+
+- `Open` and `OpenSQL` reject a DSN pragma value that holds more than one statement; the text after the first `;` used to run too, so `_pragma=foreign_keys(1)%3BATTACH%20'x.db'%20AS%20x` attached and created `x.db`.
+
 ## [0.6.8] - 2026-09-22
 
 ### Changed
@@ -162,7 +177,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Initial release: `Open` and `New`, `foreign_keys` and `busy_timeout` defaults, duplicate-key and foreign-key error translation.
 
-[Unreleased]: https://github.com/go-rio/sqlite/compare/v0.6.2...HEAD
+[Unreleased]: https://github.com/go-rio/sqlite/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/go-rio/sqlite/compare/v0.6.8...v0.7.0
+[0.6.8]: https://github.com/go-rio/sqlite/compare/v0.6.7...v0.6.8
+[0.6.7]: https://github.com/go-rio/sqlite/compare/v0.6.6...v0.6.7
+[0.6.6]: https://github.com/go-rio/sqlite/compare/v0.6.5...v0.6.6
+[0.6.5]: https://github.com/go-rio/sqlite/compare/v0.6.4...v0.6.5
+[0.6.4]: https://github.com/go-rio/sqlite/compare/v0.6.3...v0.6.4
+[0.6.3]: https://github.com/go-rio/sqlite/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/go-rio/sqlite/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/go-rio/sqlite/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/go-rio/sqlite/compare/v0.5.1...v0.6.0

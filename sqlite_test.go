@@ -106,7 +106,12 @@ func TestOpenEndToEnd(t *testing.T) {
 }
 
 func TestOpenRejects(t *testing.T) {
-	for _, dsn := range []string{"x.db?_timezone=UTC", "x.db?_txlock=bogus", "x.db?%zz"} {
+	rejects := []string{
+		"x.db?_timezone=UTC", "x.db?_txlock=bogus", "x.db?%zz",
+		"x.db?_pragma=foreign_keys(1)%3BATTACH%20'y.db'%20AS%20y",
+		"x.db?_journal_mode=WAL%3B%20ATTACH%20'y.db'%20AS%20y",
+	}
+	for _, dsn := range rejects {
 		if _, err := Open(dsn); err == nil {
 			t.Errorf("Open(%q) should fail", dsn)
 		}
@@ -157,6 +162,40 @@ func TestParseDSN(t *testing.T) {
 			slices.Equal(cfg.conn.pragmas, tc.pragmas) && cfg.single == tc.single && cfg.private == tc.private
 		if !same {
 			t.Errorf("parseDSN(%q) = %+v", tc.dsn, cfg)
+		}
+	}
+}
+
+func TestSingleStatement(t *testing.T) {
+	cases := []struct {
+		sql  string
+		want bool
+	}{
+		{"PRAGMA foreign_keys(1)", true},
+		{"PRAGMA foreign_keys(1); ;\t\r\n", true},
+		{"PRAGMA a; -- ATTACH 'x' AS x", true},
+		{"PRAGMA a; /* ATTACH 'x' AS x */ ;", true},
+		{"PRAGMA a; /* unterminated", true},
+		{"PRAGMA a('b;c')", true},
+		{"PRAGMA a('it''s;'); ", true},
+		{`PRAGMA a("b;c")`, true},
+		{"PRAGMA a(`b;c`)", true},
+		{"PRAGMA a([b;c])", true},
+		{"PRAGMA a('b;", true},
+		{"PRAGMA a -- ;\n(1)", true},
+		{"PRAGMA a\x00; ATTACH 'x' AS x", true},
+		{"PRAGMA a; ATTACH 'x' AS x", false},
+		{"PRAGMA a;ATTACH 'x' AS x", false},
+		{"PRAGMA a('it''s'); x", false},
+		{"PRAGMA a([b]); 'c'", false},
+		{"PRAGMA a; /* c */ x", false},
+		{"PRAGMA a; -- c\nx", false},
+		{"PRAGMA a; /*", false},
+		{"PRAGMA a;\v", false},
+	}
+	for _, tc := range cases {
+		if got := singleStatement(tc.sql); got != tc.want {
+			t.Errorf("singleStatement(%q) = %v, want %v", tc.sql, got, tc.want)
 		}
 	}
 }
@@ -286,9 +325,7 @@ func TestConcurrentAccess(t *testing.T) {
 	var wg sync.WaitGroup
 	errs := make(chan error, 64)
 	for g := range 8 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for i := range 25 {
 				u := user{Email: strconv.Itoa(g*100+i) + "@example.com", Name: "n"}
 				if err := rio.Insert(ctx, db, &u); err != nil {
@@ -300,7 +337,7 @@ func TestConcurrentAccess(t *testing.T) {
 					return
 				}
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	close(errs)

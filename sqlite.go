@@ -3,6 +3,13 @@
 // native channel; OpenSQL serves a thin database/sql handle for tools such
 // as go-rio/migrate. Constraint errors translate to rio sentinels with the
 // SQLite Error retained in the chain.
+//
+// Importing the package turns on two process-wide library settings where
+// the platform has them: database files take Linux OFD locks, which survive
+// a close of another descriptor of the same file in the process, and
+// commits sync with fdatasync(2). A set MODERNC_SQLITE_OFD_LOCK decides the
+// lock kind instead; modernc.org/sqlite's OFDLocking, before the first
+// connection, and Fdatasync switch either back.
 package sqlite
 
 import (
@@ -45,7 +52,8 @@ var errPoolClosed = errors.New("sqlite: pool is closed")
 // (repeatable, "name(value)"), _txlock (immediate by default; deferred or
 // exclusive), and the shorthands _busy_timeout, _auto_vacuum, _foreign_keys,
 // _journal_mode, _synchronous, and _query_only; other underscore parameters
-// are rejected. busy_timeout(5000) and foreign_keys(1) apply unless set.
+// are rejected, as is a pragma value holding more than one statement.
+// busy_timeout(5000) and foreign_keys(1) apply unless set.
 //
 // Connections open on demand up to PoolOf(db).MaxConns, GOMAXPROCS at
 // first; private memory, temporary, and shared-cache databases run on one
@@ -234,6 +242,11 @@ func parseDSN(dsn string) (dsnConfig, error) {
 		return dsnConfig{}, fmt.Errorf("unknown _txlock %q", q.Get("_txlock"))
 	}
 	cfg.conn = connConfig{name: name, vfs: q.Get("vfs"), pragmas: dsnPragmas(q)}
+	for _, p := range cfg.conn.pragmas {
+		if !singleStatement(p) {
+			return dsnConfig{}, fmt.Errorf("DSN pragma %q is more than one statement", p)
+		}
+	}
 	path := strings.TrimPrefix(name, "file:")
 	if pos := strings.IndexByte(path, '?'); pos >= 0 {
 		path = path[:pos]
@@ -291,17 +304,8 @@ func dsnPragmas(q url.Values) []string {
 // pragmaSet reports whether q sets the pragma name through _pragma or a
 // shorthand key.
 func pragmaSet(q url.Values, name string) bool {
-	for _, v := range q["_pragma"] {
-		if pragmaName(v) == name {
-			return true
-		}
-	}
-	for _, key := range pragmaAliases[name] {
-		if q.Has(key) {
-			return true
-		}
-	}
-	return false
+	named := func(v string) bool { return pragmaName(v) == name }
+	return slices.ContainsFunc(q["_pragma"], named) || slices.ContainsFunc(pragmaAliases[name], q.Has)
 }
 
 // pragmaName extracts the lower-cased name from a "name(value)" pragma entry.
@@ -318,6 +322,51 @@ func pragmaName(v string) string {
 		break
 	}
 	return strings.ToLower(v)
+}
+
+// singleStatement reports whether SQLite's tokenizer finds nothing but blanks,
+// semicolons, and comments after the first statement of sql, read up to a NUL.
+func singleStatement(sql string) bool {
+	sql, _, _ = strings.Cut(sql, "\x00")
+	ended := false
+	for i := 0; i < len(sql); {
+		c := sql[i]
+		switch {
+		case c == '-' && strings.HasPrefix(sql[i:], "--"):
+			n := strings.IndexByte(sql[i:], '\n')
+			if n < 0 {
+				return true
+			}
+			i += n + 1
+		case c == '/' && i+2 < len(sql) && sql[i+1] == '*':
+			n := strings.Index(sql[i+2:], "*/")
+			if n < 0 {
+				return true
+			}
+			i += n + 4
+		case c == ';':
+			ended = true
+			i++
+		case c == ' ' || c == '\t' || c == '\n' || c == '\f' || c == '\r':
+			i++
+		case ended:
+			return false
+		case c == '\'' || c == '"' || c == '`' || c == '[':
+			// A doubled quote lexes as two adjacent quoted tokens.
+			end := c
+			if c == '[' {
+				end = ']'
+			}
+			n := strings.IndexByte(sql[i+1:], end)
+			if n < 0 {
+				return true
+			}
+			i += n + 2
+		default:
+			i++
+		}
+	}
+	return true
 }
 
 // translate maps constraint errors to rio sentinels, nil otherwise.

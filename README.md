@@ -102,7 +102,8 @@ A path, `:memory:`, or a `file:` URI. SQLite reads the URI parameters
 through either form. Pragmas run in the modernc driver's order:
 `busy_timeout`, `auto_vacuum`, the `_pragma` list, `foreign_keys`,
 `journal_mode`, `synchronous`, `query_only`. Any other underscore parameter
-is rejected.
+is rejected, and so is a pragma value that holds a second statement after a
+`;` (`%3B` in the query): `Open` and `OpenSQL` fail on it.
 
 ### Connections
 
@@ -124,6 +125,26 @@ sqlite.PoolOf(db).SetMaxConns(8)
 
 WAL is persistent and creates `-wal`/`-shm` sidecar files, so it is not on
 by default; check filesystem support first.
+
+### Locking and syncing
+
+Importing the module turns on two process-wide modernc.org/sqlite settings
+where the platform has them:
+
+- **OFD locks** (Linux): database file locks belong to the connection's own
+  open file description, so closing another descriptor of the same file
+  anywhere in the process no longer drops them and lets other processes
+  write mid-transaction. Locks on the WAL `-shm` file stay POSIX locks, and
+  fcntl locks the program takes on a database file now conflict with
+  SQLite's.
+- **fdatasync** (Linux, FreeBSD, NetBSD, illumos): commits sync with
+  `fdatasync(2)` instead of `fsync(2)`, skipping the timestamp update at the
+  same durability.
+
+A set `MODERNC_SQLITE_OFD_LOCK` environment variable decides the lock kind
+instead. To opt out from Go, call `OFDLocking(false)` from
+`modernc.org/sqlite` before the first connection opens, or `Fdatasync(false)`
+at any time.
 
 ### Transactions and cancellation
 

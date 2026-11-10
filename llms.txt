@@ -46,11 +46,12 @@ func main() {
 ## Key Concepts
 
 - **Native channel**: `Open` bypasses database/sql; nothing opens until first use, so invalid paths surface then. `rio.WithStmtCache` is unsupported because each connection caches prepared statements itself.
-- **DSN**: a path, `:memory:`, or a `file:` URI. Module parameters: `_pragma=name(value)` (repeatable), `_txlock` (`immediate` default, `deferred`, `exclusive`), and the shorthands `_busy_timeout`/`_timeout`, `_auto_vacuum`/`_vacuum`, `_foreign_keys`/`_fk`, `_journal_mode`/`_journal`, `_synchronous`/`_sync`, `_query_only`. `busy_timeout(5000)` and `foreign_keys(1)` apply unless set; other underscore parameters are rejected.
+- **DSN**: a path, `:memory:`, or a `file:` URI. Module parameters: `_pragma=name(value)` (repeatable), `_txlock` (`immediate` default, `deferred`, `exclusive`), and the shorthands `_busy_timeout`/`_timeout`, `_auto_vacuum`/`_vacuum`, `_foreign_keys`/`_fk`, `_journal_mode`/`_journal`, `_synchronous`/`_sync`, `_query_only`. `busy_timeout(5000)` and `foreign_keys(1)` apply unless set; other underscore parameters, and pragma values holding more than one statement, are rejected.
 - **Pool**: connections open on demand up to `PoolOf(db).MaxConns()` (`GOMAXPROCS`); `SetMaxConns` changes the cap. Private memory, temporary, and shared-cache databases run on one connection.
 - **Transactions**: `BEGIN` in the `_txlock` mode, deferred when read-only; a failed `COMMIT` rolls back before the connection returns; nested `rio.Tx` calls are savepoints. A canceled context interrupts the running statement.
 - **Values**: `time.Time` binds as `2006-01-02 15:04:05.999999+00:00` at UTC; TEXT in `time.Time` fields or `DATE`/`DATETIME`/`TIMESTAMP` columns parses SQLite's date-time forms to UTC.
 - **`Unwrap`**: a database/sql view with connections of its own; nil for private memory and temporary databases.
+- **Process-wide defaults**: importing the module turns on OFD locks (Linux) and `fdatasync` commits (Linux, FreeBSD, NetBSD, illumos). A set `MODERNC_SQLITE_OFD_LOCK` decides the lock kind; `modernc.org/sqlite`'s `OFDLocking(false)` (before the first connection) and `Fdatasync(false)` opt out.
 
 ## API Reference
 
